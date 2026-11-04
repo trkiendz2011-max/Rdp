@@ -1,0 +1,2089 @@
+# GitHub Actions Windows RDP (Tailscale) - chọn Windows Server 2022 hoặc Windows 11
+# Secrets cần có:
+# - RDP_PASSWORD      : mật khẩu >= 14 ký tự, đủ 3/4 loại ký tự
+# - TAILSCALE_AUTHKEY : key reusable, nên tạo key ephemeral (máy tự xoá khỏi tailnet khi tắt)
+#   Nên gắn tag/ACL riêng và đặt hạn ngắn; dùng lâu dài thì thay bằng OAuth client.
+# Lưu thành .github/workflows/rdp.yml trên default branch
+#
+# Cấu hình free tối đa (repo PUBLIC): 4 vCPU / 16 GB RAM / 14 GB SSD
+# Repo PRIVATE chỉ được 2 vCPU / 8 GB RAM (GitHub giới hạn, không đổi được).
+# Phút Actions: repo private tính ~2x cho Windows (330 phút ~ 660 phút billed).
+# Không chạy liên tục như VPS/gaming; GitHub có thể hạn chế tài khoản nếu lạm dụng.
+#
+# Mặc định tối đa free: windows-2025 x64, 330 phút/lượt, tự nối lượt, cài nhanh,
+# Vulkan 3 luồng, RDP balanced. Đổi runner/quality ngay trong Run workflow.
+#
+# Ba lựa chọn:
+# - windows-2022   : Windows Server 2022 x64 (nhẹ/ổn định nhất)
+# - windows-2025   : Windows Server 2025 x64 (mặc định; kernel 10.0.26100 giống Win11 24H2,
+#                    hợp app Win11 hơn 2022; KHÔNG phải Windows 11 Lite/Tiny11)
+# - windows-11-arm : Windows 11 Enterprise ARM64 (Win11 thật, app x86/x64 chạy giả lập)
+#   LƯU Ý: windows-11-arm chỉ có trên repo PUBLIC. Repo private sẽ không có máy chạy
+#   (job đứng "Waiting for a runner" mãi). GitHub không có runner Windows 11 x64 miễn phí.
+#
+# Vulkan: runtime LunarG + Mesa lavapipe (Vulkan) / llvmpipe (OpenGL) chạy bằng CPU.
+# Số luồng CPU cho Vulkan chọn ở input vulkan_threads (1 = chừa CPU cho app, 2 = cân bằng,
+# 3 = nhanh (mặc định), 4 = tối đa; luôn tự chừa ít nhất 1 luồng cho app/RDP).
+# Chất lượng RDP chọn ở input rdp_quality (smooth = 30fps nhẹ mạng, balanced/sharp = 60fps, sharp bật ClearType).
+# Không thể cài Windows 11 Lite/Tiny11 trên runner GitHub-hosted (image cố định, không boot ISO).
+#
+# Ghi chú: bước 6b2 chỉ đổi TÊN hiển thị GPU thành "NVIDIA GeForce RTX 5090" (nhãn giả),
+# không thêm GPU thật; hiệu năng vẫn là CPU (Mesa llvmpipe cho OpenGL, lavapipe cho Vulkan).
+# Bước 3c: watchdog ẩn (SYSTEM + wscript //B, 1 phút/lần) tự bật lại Tailscale/RDP; không có
+# cửa sổ cmd/PowerShell trên desktop. Muốn tắt hẳn: schtasks /Delete /TN TailscaleWatchdog /F
+# Bước 5: bật audio capture (mic) best-effort; Windows Server có thể vẫn không có mic nếu thiếu RDSH.
+# Bước 5b: tải hình nền từ Google Drive và đặt chế độ Fill (lỗi thì giữ hình mặc định).
+# Bước 6c: cài MSI Afterburner + RTSS + PresentMon, tạo shortcut Desktop để xem FPS.
+# Toi-uu-PC.vbs chạy tối ưu ẩn, tự đóng (không treo chờ Enter), log ở C:\Tools\toi-uu-pc.log.
+# Bước 6d: cài Discord + Roblox Studio; installer luôn được lưu ở Desktop làm dự phòng.
+#
+# TỰ ĐỘNG (không cần bấm Run workflow):
+# - Mỗi 30 phút GitHub tự thử bật máy (cron phút 17 và 47). Nếu đã có máy đang chạy thì bỏ qua,
+#   không tạo máy trùng. Khi phiên cũ kết thúc, lượt kế tiếp sẽ tự bật lại.
+# - Lượt theo lịch dùng mặc định: windows-2025, 330 phút, tự nối lượt, cài nhanh,
+#   Vulkan 3 luồng, RDP balanced.
+# - Lịch chỉ chạy trên nhánh mặc định; GitHub có thể trễ vài phút và sẽ tự tắt lịch
+#   nếu repo không hoạt động 60 ngày (vào tab Actions bật lại).
+# - Muốn tắt tự động: xoá/comment khối "schedule:" bên dưới hoặc tắt workflow trong Actions.
+#
+# CHẠY NHANH: mặc định chỉ cài app thiết yếu (7-Zip, VC++/DirectX, ImDisk, UniKey,
+# MSI Afterburner/RTSS, PresentMon, Discord, Roblox Studio). App nặng (Rainmeter,
+# trình duyệt, CPU-Z/GPU-Z, Sysinternals, FFmpeg...) chỉ cài khi chọn install_extra = true.
+# Muốn bản đầy đủ chạy tự động: chạy tay một lần với install_extra = true;
+# các lượt tự nối sẽ giữ nguyên chế độ đầy đủ. Hoặc tạo biến repo
+# RDP_INSTALL_EXTRA = true (Settings → Secrets and variables → Actions → Variables)
+# để mọi lượt, kể cả theo lịch, đều cài bản đầy đủ.
+# Chạy tay sẽ dừng các lượt cũ trước khi bật máy mới.
+name: Windows RDP
+
+on:
+  schedule:
+    # Phút 17/47 để tránh GitHub quá tải đầu giờ; chạy mỗi 30 phút một lần.
+    - cron: "17,47 * * * *"
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Chọn Windows (mặc định windows-2025): windows-2022 = Server 2022 x64 | windows-2025 = Server 2025 x64 | windows-11-arm = Win11 ARM64 (chỉ repo public)"
+        required: true
+        default: "windows-2025"
+        type: choice
+        options:
+          - "windows-2022"
+          - "windows-2025"
+          - "windows-11-arm"
+      minutes:
+        description: "Thời gian giữ máy (phút; 330 = tối đa an toàn cho job 360 phút)"
+        required: true
+        default: "330"
+        type: choice
+        options:
+          - "60"
+          - "120"
+          - "240"
+          - "330"
+      auto_renew:
+        description: "Tự bật máy mới trước khi hết giờ để chạy liên tục (nối tiếp nhiều lượt 6 giờ)"
+        required: true
+        default: true
+        type: boolean
+      install_extra:
+        description: "Cài thêm app nặng (Rainmeter, Firefox/Brave, CPU-Z/GPU-Z, Sysinternals, FFmpeg...). Bật sẽ chậm hơn."
+        required: false
+        default: false
+        type: boolean
+      vulkan_threads:
+        description: "Số luồng CPU cho Vulkan/Mesa: 1 = chừa CPU, 2 = cân bằng, 3 = nhanh (mặc định), 4 = tối đa (tự chừa 1 luồng cho app/RDP)"
+        required: false
+        default: "3"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "3"
+          - "4"
+      rdp_quality:
+        description: "Chất lượng RDP: smooth = 30fps nhẹ mạng, balanced = 60fps (khuyên dùng), sharp = 60fps + ClearType"
+        required: false
+        default: "balanced"
+        type: choice
+        options:
+          - "smooth"
+          - "balanced"
+          - "sharp"
+      renew_from:
+        description: "Workflow tự điền khi nối lượt, KHÔNG điền tay"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  actions: write   # cần để workflow tự gọi lại chính nó (auto_renew) và dọn lượt cũ
+
+# Chạy tay dùng group windows-rdp để huỷ lượt tay cũ.
+# Lượt tự nối / theo lịch dùng group riêng để KHÔNG huỷ máy đang chạy;
+# job preflight sẽ kiểm tra hoặc dọn lượt cũ trước khi bật máy mới.
+concurrency:
+  group: ${{ (github.event_name == 'schedule' || github.event.inputs.renew_from != '') && format('windows-rdp-{0}', github.run_id) || 'windows-rdp' }}
+  cancel-in-progress: true
+
+jobs:
+  preflight:
+    name: Kiểm tra trước khi chạy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      start: ${{ steps.guard.outputs.start }}
+    steps:
+      - name: Dọn lượt cũ hoặc bỏ qua nếu đã có máy
+        id: guard
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          CURRENT: ${{ github.run_id }}
+          EVENT: ${{ github.event_name }}
+          RENEW_FROM: ${{ github.event.inputs.renew_from }}
+        run: |
+          set -uo pipefail
+          wf="${GITHUB_WORKFLOW_REF%%@*}"
+          wf="${wf##*/}"
+          echo "Workflow: $wf | Kiểu chạy: $EVENT"
+
+          if ! active=$(gh run list --repo "$REPO" --workflow "$wf" --limit 100 \
+            --json databaseId,status \
+            --jq ".[] | select(.databaseId != $CURRENT and .status != \"completed\") | .databaseId"); then
+            echo "Không đọc được danh sách lượt chạy."
+            echo "### Không đọc được danh sách lượt chạy" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$EVENT" = "schedule" ]; then
+              echo "start=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "start=true" >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
+
+          ids=()
+          while IFS= read -r id; do
+            if [ -n "$id" ]; then ids+=("$id"); fi
+          done <<< "$active"
+          echo "Lượt khác đang chạy/đang chờ: ${#ids[@]}"
+
+          if [ -n "${RENEW_FROM:-}" ]; then
+            # Lượt tự nối: bật máy mới trong lúc máy cũ còn chạy, KHÔNG dọn máy cũ
+            echo "Lượt tự nối: bật máy mới, giữ máy cũ đến khi máy mới sẵn sàng."
+            echo "### Lượt tự nối" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Bật máy mới, giữ máy cũ đến khi máy mới sẵn sàng." >> "$GITHUB_STEP_SUMMARY"
+            echo "start=true" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT" = "schedule" ]; then
+            if [ "${#ids[@]}" -gt 0 ]; then
+              echo "Đã có máy đang chạy → bỏ qua lượt tự động này."
+              echo "### Bỏ qua lượt tự động" >> "$GITHUB_STEP_SUMMARY"
+              echo "- Đã có ${#ids[@]} lượt đang chạy/đang chờ; không tạo máy trùng." >> "$GITHUB_STEP_SUMMARY"
+              echo "start=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "Không có máy đang chạy → bật máy mới."
+              echo "### Bật máy mới theo lịch" >> "$GITHUB_STEP_SUMMARY"
+              echo "- Không có máy nào đang chạy." >> "$GITHUB_STEP_SUMMARY"
+              echo "start=true" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            # Chạy tay: dừng mọi lượt cũ (kể cả lượt tự nối ở group riêng)
+            for id in "${ids[@]}"; do
+              echo "Dừng lượt cũ $id"
+              gh run cancel "$id" --repo "$REPO" || true
+            done
+            echo "### Chạy tay" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Đã dừng ${#ids[@]} lượt cũ (nếu có) trước khi bật máy mới." >> "$GITHUB_STEP_SUMMARY"
+            echo "start=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  rdp:
+    needs: preflight
+    if: always() && (github.event_name != 'schedule' || needs.preflight.outputs.start == 'true')
+    name: RDP ${{ github.event.inputs.runner || 'windows-2025' }}
+    runs-on: ${{ github.event.inputs.runner || 'windows-2025' }}
+    timeout-minutes: 360
+    env:
+      RDP_USER: runneradmin
+      TS_HOST: gh-rdp-${{ github.run_id }}
+      RDP_RUNNER: ${{ github.event.inputs.runner || 'windows-2025' }}
+      RDP_MINUTES: ${{ github.event.inputs.minutes || '330' }}
+      RDP_AUTO_RENEW: ${{ github.event_name == 'schedule' || github.event.inputs.auto_renew == 'true' || github.event.inputs.auto_renew == true }}
+      INSTALL_EXTRA: ${{ github.event.inputs.install_extra == 'true' || github.event.inputs.install_extra == true || vars.RDP_INSTALL_EXTRA == 'true' || vars.RDP_INSTALL_EXTRA == true }}
+      VULKAN_THREADS: ${{ github.event.inputs.vulkan_threads || '3' }}
+      RDP_QUALITY: ${{ github.event.inputs.rdp_quality || 'balanced' }}
+      RENEW_FROM: ${{ github.event.inputs.renew_from }}
+
+    steps:
+      - name: 1. Kiểm tra máy
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          Add-Content -Path $env:GITHUB_ENV -Value "JOB_START=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"
+          Write-Host "Runner label: $env:RDP_RUNNER"
+          try {
+            $os  = Get-CimInstance Win32_OperatingSystem
+            $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+            $cs  = Get-CimInstance Win32_ComputerSystem
+            $ram = [math]::Round($cs.TotalPhysicalMemory / 1GB, 1)
+            Write-Host "OS: $($os.Caption) | Version: $($os.Version) | Arch: $($os.OSArchitecture)"
+            Write-Host "CPU: $($cpu.Name) | $($cpu.NumberOfCores) cores / $($cpu.NumberOfLogicalProcessors) threads"
+            Write-Host "RAM: $ram GB"
+            if ($cpu.NumberOfLogicalProcessors -lt 4) {
+              Write-Warning "Máy chỉ có $($cpu.NumberOfLogicalProcessors) luồng CPU (thiếu 4 vCPU). Repo private chỉ có 2 vCPU; dùng repo public."
+            }
+            if ($ram -lt 15) {
+              Write-Warning "RAM dưới 16GB: repo private chỉ có 2 vCPU/8GB. Dùng repo public để có 4 vCPU/16GB."
+            }
+          } catch {
+            Write-Warning "Không đọc được cấu hình máy: $($_.Exception.Message)"
+          }
+
+      - name: 2. Bật RDP
+        shell: pwsh
+        timeout-minutes: 10
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) { throw "Thiếu secret RDP_PASSWORD." }
+          if ($env:RDP_PASSWORD.Length -lt 14) { throw "RDP_PASSWORD phải từ 14 ký tự." }
+          $classes = @(
+            ($env:RDP_PASSWORD -cmatch '[A-Z]'),
+            ($env:RDP_PASSWORD -cmatch '[a-z]'),
+            ($env:RDP_PASSWORD -match '\d'),
+            ($env:RDP_PASSWORD -match '[^A-Za-z0-9]')
+          ) | Where-Object { $_ }
+          if ($classes.Count -lt 3) {
+            throw "RDP_PASSWORD cần ít nhất 3 trong 4 loại: chữ hoa, chữ thường, số, ký tự đặc biệt."
+          }
+
+          $user = $env:RDP_USER
+          if (-not (Get-LocalUser -Name $user -ErrorAction SilentlyContinue)) {
+            Write-Warning "Không thấy user $user, thử user đang chạy runner: $env:USERNAME"
+            $user = $env:USERNAME
+            if (-not (Get-LocalUser -Name $user -ErrorAction SilentlyContinue)) {
+              Get-LocalUser | ForEach-Object { Write-Host "User có sẵn: $($_.Name)" }
+              throw "Không thấy user RDP nào ($env:RDP_USER / $env:USERNAME)."
+            }
+            Add-Content -Path $env:GITHUB_ENV -Value "RDP_USER=$user"
+          }
+
+          $sec = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          Set-LocalUser -Name $user -Password $sec -PasswordNeverExpires $true
+          Enable-LocalUser -Name $user -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $user -ErrorAction SilentlyContinue
+
+          try {
+            $acct = [ADSI]"WinNT://$env:COMPUTERNAME/$user,user"
+            $acct.PasswordExpired = 0
+            $acct.SetInfo()
+          } catch {
+            Write-Warning "Không clear được PasswordExpired: $($_.Exception.Message)"
+          }
+
+          $ts  = "HKLM:\System\CurrentControlSet\Control\Terminal Server"
+          $tcp = "$ts\WinStations\RDP-Tcp"
+          Set-ItemProperty $ts  -Name "fDenyTSConnections" -Value 0 -Type DWord
+          Set-ItemProperty $tcp -Name "UserAuthentication" -Value 1 -Type DWord
+          Set-ItemProperty $tcp -Name "MaxIdleTime" -Value 0 -Type DWord
+          Set-ItemProperty $tcp -Name "MaxDisconnectionTime" -Value 0 -Type DWord
+
+          # Mic: cho phép audio capture trước khi TermService khởi động lại bên dưới.
+          # (Vẫn cần RDSH + phiên không phải admin + client bật "Record from this computer".)
+          $tsPol = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+          if (-not (Test-Path $tsPol)) { New-Item -Path $tsPol -Force | Out-Null }
+          Set-ItemProperty $tsPol -Name "fDisableAudioCapture" -Value 0 -Type DWord
+          Set-ItemProperty $tcp   -Name "fDisableAudioCapture" -Value 0 -Type DWord
+
+          # Chỉ cho RDP đi qua Tailscale (IPv4 100.64/10 + IPv6 fd7a:115c:a1e0::/48), chặn mạng ngoài
+          Get-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue |
+            Disable-NetFirewallRule -ErrorAction SilentlyContinue
+          foreach ($n in @(
+            "RDP Tailscale TCP", "RDP Tailscale UDP",
+            "RDP Tailscale TCP v4", "RDP Tailscale TCP v6",
+            "RDP Tailscale UDP v4", "RDP Tailscale UDP v6"
+          )) {
+            Remove-NetFirewallRule -DisplayName $n -ErrorAction SilentlyContinue
+          }
+          New-NetFirewallRule -DisplayName "RDP Tailscale TCP v4" -Direction Inbound `
+            -Protocol TCP -LocalPort 3389 -Action Allow -Profile Any `
+            -RemoteAddress "100.64.0.0/10" | Out-Null
+          New-NetFirewallRule -DisplayName "RDP Tailscale UDP v4" -Direction Inbound `
+            -Protocol UDP -LocalPort 3389 -Action Allow -Profile Any `
+            -RemoteAddress "100.64.0.0/10" | Out-Null
+          New-NetFirewallRule -DisplayName "RDP Tailscale TCP v6" -Direction Inbound `
+            -Protocol TCP -LocalPort 3389 -Action Allow -Profile Any `
+            -RemoteAddress "fd7a:115c:a1e0::/48" | Out-Null
+          New-NetFirewallRule -DisplayName "RDP Tailscale UDP v6" -Direction Inbound `
+            -Protocol UDP -LocalPort 3389 -Action Allow -Profile Any `
+            -RemoteAddress "fd7a:115c:a1e0::/48" | Out-Null
+
+          Set-Service TermService -StartupType Manual
+          try {
+            Restart-Service TermService -Force -ErrorAction Stop
+          } catch {
+            Write-Warning "Restart TermService lỗi: $($_.Exception.Message)"
+            Stop-Service UmRdpService -Force -ErrorAction SilentlyContinue
+            Stop-Service TermService -Force -ErrorAction SilentlyContinue
+            Start-Service TermService -ErrorAction SilentlyContinue
+            Start-Service UmRdpService -ErrorAction SilentlyContinue
+          }
+
+          $ok = $false
+          for ($i = 0; $i -lt 60; $i++) {
+            if (Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue) {
+              $ok = $true; break
+            }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $ok) { throw "RDP không mở cổng 3389." }
+          Write-Host "RDP đã bật cho $user."
+
+      - name: 3. Tailscale
+        shell: pwsh
+        timeout-minutes: 15
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
+          $ProgressPreference = "SilentlyContinue"
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) { throw "Thiếu secret TAILSCALE_AUTHKEY." }
+
+          function Get-File([string]$Url, [string]$Out) {
+            $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
+            if ($curl) {
+              & $curl.Source -L --fail --retry 3 --retry-delay 5 `
+                --connect-timeout 20 --max-time 300 -sS -o $Out $Url
+              if ($LASTEXITCODE -eq 0 -and (Test-Path $Out)) { return }
+              Write-Warning "curl lỗi ($LASTEXITCODE), thử Invoke-WebRequest..."
+            }
+            Invoke-WebRequest -Uri $Url -OutFile $Out -MaximumRedirection 10 `
+              -Headers @{ "User-Agent" = "Mozilla/5.0" }
+          }
+
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (-not (Test-Path $ts)) {
+            $osArch = (Get-CimInstance Win32_OperatingSystem).OSArchitecture
+            if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64" -or $osArch -match "ARM") {
+              $arch = "arm64"
+            } else {
+              $arch = "amd64"
+            }
+            $msi = "$env:TEMP\tailscale-setup-$arch.msi"
+            $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-$arch.msi"
+            Write-Host "Tải Tailscale ($arch)..."
+
+            $ok = $false
+            for ($i = 0; $i -lt 3; $i++) {
+              try {
+                Get-File $url $msi
+                if ((Get-Item $msi).Length -gt 3MB) { $ok = $true; break }
+              } catch {
+                Write-Warning "Tải Tailscale lỗi: $($_.Exception.Message)"
+              }
+              Start-Sleep -Seconds 5
+            }
+            if (-not $ok) { throw "Tải Tailscale thất bại." }
+
+            $p = Start-Process -FilePath "msiexec.exe" `
+              -ArgumentList "/i `"$msi`" /qn /norestart TS_NOLAUNCH=true TS_UNATTENDEDMODE=true" `
+              -PassThru -Wait
+            if ($p.ExitCode -notin @(0, 3010, 1641)) { throw "Cài Tailscale lỗi (exit $($p.ExitCode))." }
+          } else {
+            Write-Host "Tailscale đã cài sẵn."
+          }
+          if (-not (Test-Path $ts)) { throw "Không thấy tailscale.exe." }
+
+          $svc = $null
+          for ($i = 0; $i -lt 30; $i++) {
+            $svc = Get-Service | Where-Object { $_.Name -match 'Tailscale' } | Select-Object -First 1
+            if ($svc) { break }
+            Start-Sleep -Seconds 2
+          }
+          if (-not $svc) { throw "Không thấy service Tailscale." }
+          Set-Service -Name $svc.Name -StartupType Automatic -ErrorAction SilentlyContinue
+          if ($svc.Status -ne "Running") {
+            Start-Service -Name $svc.Name -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 5
+          }
+          $svc = Get-Service -Name $svc.Name -ErrorAction SilentlyContinue
+          if (-not $svc -or $svc.Status -ne "Running") { throw "Service Tailscale không chạy." }
+
+          Start-Sleep -Seconds 5
+          $up = $false
+          for ($i = 0; $i -lt 3; $i++) {
+            $upOut = & $ts up --auth-key $env:TS_AUTHKEY --hostname $env:TS_HOST `
+              --accept-dns=false --unattended 2>&1
+            $upOut | ForEach-Object { Write-Host $_ }
+            if ($LASTEXITCODE -eq 0) { $up = $true; break }
+            Write-Warning "tailscale up lỗi (lần $($i + 1)), thử lại..."
+            Start-Sleep -Seconds 5
+          }
+          if (-not $up) {
+            & $ts status 2>&1 | ForEach-Object { Write-Host $_ }
+            throw "tailscale up thất bại."
+          }
+
+          $ip = $null
+          for ($i = 0; $i -lt 60; $i++) {
+            $ip = (& $ts ip -4 2>$null | ForEach-Object {
+              $m = [regex]::Match($_, '100\.\d{1,3}\.\d{1,3}\.\d{1,3}')
+              if ($m.Success) { $m.Value }
+            } | Select-Object -First 1)
+            if ($ip) { break }
+            Start-Sleep -Seconds 2
+          }
+          if (-not $ip) { throw "Tailscale chưa có IP." }
+          Write-Host "Tailscale IP: $ip"
+          Add-Content -Path $env:GITHUB_ENV -Value "TS_IP=$ip"
+
+      - name: 3b. Thông tin kết nối sớm
+        shell: pwsh
+        run: |
+          $ip = $env:TS_IP
+          if (-not $ip) {
+            $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+            $ip = (& $ts ip -4 2>$null | ForEach-Object {
+              $m = [regex]::Match($_, '100\.\d{1,3}\.\d{1,3}\.\d{1,3}')
+              if ($m.Success) { $m.Value }
+            } | Select-Object -First 1)
+          }
+          if (-not $ip) { throw "Chưa lấy được Tailscale IP." }
+
+          $text = @(
+            "## RDP sẵn sàng - có thể kết nối ngay",
+            "- Host: $ip",
+            "- Port: 3389",
+            "- User: $env:RDP_USER",
+            "- Password: secret RDP_PASSWORD",
+            "- Máy vẫn đang cài app; cứ kết nối, app sẽ dần xuất hiện."
+          ) -join "`n"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $text
+          Write-Host $text
+
+      - name: 3c. Tailscale tự phục hồi (ẩn, không cửa sổ)
+        shell: pwsh
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          $ErrorActionPreference = "Continue"
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          $svc = Get-Service | Where-Object { $_.Name -match "Tailscale" } | Select-Object -First 1
+          if (-not $svc) {
+            Write-Warning "Không thấy service Tailscale; bỏ qua watchdog."
+            Add-Content -Path $env:GITHUB_ENV -Value "TS_WATCHDOG=không có service"
+            exit 0
+          }
+          $svcName = $svc.Name
+
+          # Windows tự khởi động lại service nếu bị crash/dừng (không cần cửa sổ nào)
+          & sc.exe failure $svcName reset= 86400 actions= restart/5000/restart/10000/restart/30000 | Out-Null
+          Write-Host "Đã bật service recovery cho $svcName."
+
+          # Script chạy ẩn: service dừng thì bật lại; Tailscale mất kết nối thì up lại; RDP rớt thì restart TermService
+          $dir = "C:\Tools"
+          New-Item -ItemType Directory -Path $dir -Force | Out-Null
+          $watch = Join-Path $dir "ts-watchdog.ps1"
+          $body = @'
+          $ErrorActionPreference = "Continue"
+          $log = "C:\Tools\ts-watchdog.log"
+          function Write-Log([string]$m) {
+            try {
+              if ((Test-Path $log) -and ((Get-Item $log).Length -gt 1MB)) { Remove-Item $log -Force }
+              Add-Content -Path $log -Value ("{0} {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $m)
+            } catch { }
+          }
+          $svc = Get-Service | Where-Object { $_.Name -match "Tailscale" } | Select-Object -First 1
+          if ($svc -and $svc.Status -ne "Running") {
+            Write-Log "Service $($svc.Name) đang $($svc.Status) -> bật lại"
+            try { Start-Service $svc.Name -ErrorAction Stop } catch { Write-Log "Start-Service lỗi: $($_.Exception.Message)" }
+            Start-Sleep -Seconds 8
+          }
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (Test-Path $ts) {
+            $out = & $ts status --peers=false 2>&1
+            $code = $LASTEXITCODE
+            $text = ($out | Out-String)
+            if ($code -ne 0 -or $text -match "stopped|Logged out|not logged in") {
+              Write-Log "Tailscale chưa sẵn sàng (exit $code) -> tailscale up"
+              & $ts up --unattended --accept-dns=false --timeout 60s *> $null
+              Write-Log "tailscale up exit $LASTEXITCODE"
+            }
+          }
+          if (-not (Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue)) {
+            Write-Log "RDP 3389 không listen -> restart TermService"
+            Restart-Service TermService -Force -ErrorAction SilentlyContinue
+          }
+          '@
+          Set-Content -Path $watch -Value $body -Encoding utf8BOM
+
+          # VBS chạy PowerShell với window style 0: không nháy cmd/PowerShell trên desktop
+          $vbs = Join-Path $dir "ts-watchdog.vbs"
+          $vbsBody = @'
+          ' Chay watchdog PowerShell an hoan toan (khong cua so)
+          Set sh = CreateObject("WScript.Shell")
+          sh.Run "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File ""C:\Tools\ts-watchdog.ps1""", 0, True
+          '@
+          Set-Content -Path $vbs -Value $vbsBody -Encoding ascii
+
+          # Task SYSTEM + Hidden + wscript //B: không có cửa sổ nào trên desktop
+          $task = "TailscaleWatchdog"
+          $wscript = Join-Path $env:SystemRoot "System32\wscript.exe"
+          $act = New-ScheduledTaskAction -Execute $wscript `
+            -Argument "//B //Nologo `"$vbs`""
+          $trigStart = New-ScheduledTaskTrigger -AtStartup
+          $trigLoop = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(1)) `
+            -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration (New-TimeSpan -Days 3650)
+          $prin = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+          $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+            -StartWhenAvailable -MultipleInstances IgnoreNew -Hidden `
+            -ExecutionTimeLimit (New-TimeSpan -Minutes 3)
+          Register-ScheduledTask -TaskName $task -Action $act -Trigger @($trigStart, $trigLoop) `
+            -Principal $prin -Settings $set -Force | Out-Null
+          Start-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 3
+
+          $ti = Get-ScheduledTaskInfo -TaskName $task -ErrorAction SilentlyContinue
+          if ($ti) {
+            Write-Host "Watchdog: đã đăng ký (1 phút/lần, ẩn, SYSTEM). Lần chạy cuối: $($ti.LastRunTime), kết quả: $($ti.LastTaskResult)"
+            Add-Content -Path $env:GITHUB_ENV -Value "TS_WATCHDOG=OK (ẩn, 1 phút/lần)"
+          } else {
+            Write-Warning "Không đăng ký được watchdog."
+            Add-Content -Path $env:GITHUB_ENV -Value "TS_WATCHDOG=LỖI"
+          }
+          exit 0
+
+      - name: 5. Tối ưu hiệu năng
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = "Continue"
+          # Chất lượng RDP: smooth = nhẹ cho mạng yếu, balanced = 60fps, sharp = nét hơn
+          $quality = if ($env:RDP_QUALITY) { "$env:RDP_QUALITY".Trim().ToLowerInvariant() } else { "balanced" }
+          switch ($quality) {
+            "smooth" { $colorDepth = 3; $dwmInterval = 33; $fontSmooth = 0; $fontType = 0 }
+            "sharp"  { $colorDepth = 5; $dwmInterval = 16; $fontSmooth = 2; $fontType = 2 }
+            default  { $colorDepth = 5; $dwmInterval = 16; $fontSmooth = 2; $fontType = 1; $quality = "balanced" }
+          }
+          # AVC444 (H.264) nén đẹp hơn nhưng tốn CPU khi không có GPU -> chỉ bật ở sharp.
+          # Wallpaper tĩnh gần như không tốn băng thông -> chỉ tắt ở smooth.
+          $avc444 = if ($quality -eq "sharp") { 1 } else { 0 }
+          $wallpaperOff = if ($quality -eq "smooth") { 1 } else { 0 }
+          Write-Host "Chất lượng RDP: $quality | frame ${dwmInterval}ms | font $fontType | AVC444 $avc444 | wallpaper off $wallpaperOff"
+          function Set-Reg([string]$Path, [string]$Name, $Value, [string]$Type = "DWord") {
+            try {
+              if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
+              Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type $Type -ErrorAction Stop
+            } catch { Write-Warning "Reg $Path\$Name lỗi: $($_.Exception.Message)" }
+          }
+
+          tzutil /s "SE Asia Standard Time"
+          powercfg /hibernate off
+          # High performance (SCHEME_MIN là Power saver -> sẽ làm máy chậm)
+          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+          powercfg /change monitor-timeout-ac 0
+          powercfg /change standby-timeout-ac 0
+
+          # Giảm hiệu ứng giao diện để RDP mượt hơn
+          $vfx = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects"
+          New-Item -Path $vfx -Force | Out-Null
+          Set-ItemProperty $vfx -Name "VisualFXSetting" -Value 2 -Type DWord
+          Set-ItemProperty "HKCU:\Control Panel\Desktop" -Name "DragFullWindows" -Value "0"
+          Set-ItemProperty "HKCU:\Control Panel\Desktop\WindowMetrics" -Name "MinAnimate" -Value "0"
+          Set-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" `
+            -Name "EnableTransparency" -Value 0 -Type DWord
+
+          # Tắt service nền không cần
+          foreach ($s in @("SysMain", "WSearch", "DiagTrack")) {
+            Stop-Service $s -Force -ErrorAction SilentlyContinue
+            Set-Service $s -StartupType Disabled -ErrorAction SilentlyContinue
+          }
+
+          # Tắt quét Defender thời gian thực (đỡ tốn CPU, máy dùng xong bỏ)
+          try { Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction Stop } catch {
+            Write-Warning "Không tắt được Defender: $($_.Exception.Message)"
+          }
+          Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender" "DisableAntiSpyware" 1
+          Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection" "DisableRealtimeMonitoring" 1
+          Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection" "DisableBehaviorMonitoring" 1
+          Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection" "DisableOnAccessProtection" 1
+          Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection" "DisableScanOnRealtimeEnable" 1
+
+          netsh int tcp set global autotuninglevel=normal | Out-Null
+          netsh int tcp set global rss=enabled | Out-Null
+          # Giảm overhead/trễ trên đường truyền dài (Tailscale -> runner)
+          netsh int tcp set global ecncapability=disabled | Out-Null
+          netsh int tcp set global timestamps=disabled | Out-Null
+          # Tắt Nagle trên mọi card mạng (áp dụng sớm, trước khi user kết nối RDP)
+          Get-ChildItem "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces" -ErrorAction SilentlyContinue | ForEach-Object {
+            Set-ItemProperty $_.PSPath -Name "TcpAckFrequency" -Value 1 -Type DWord -ErrorAction SilentlyContinue
+            Set-ItemProperty $_.PSPath -Name "TCPNoDelay" -Value 1 -Type DWord -ErrorAction SilentlyContinue
+          }
+
+          # --- QoS + font smoothing theo chất lượng RDP ---
+          Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Psched" "NonBestEffortLimit" 0
+          Set-Reg "HKCU:\Control Panel\Desktop" "FontSmoothing" "$fontSmooth" "String"
+          Set-Reg "HKCU:\Control Panel\Desktop" "FontSmoothingType" $fontType
+          Set-Reg "HKCU:\Control Panel\Desktop" "FontSmoothingOrientation" 1
+          Set-Reg "HKCU:\Control Panel\Desktop" "FontSmoothingGamma" 1440
+
+          # --- RDP mượt hơn: frame interval + UDP + nén H.264 AVC444 ---
+          $wsTcp = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations"
+          Set-Reg $wsTcp "DWMFRAMEINTERVAL" $dwmInterval
+          $tsPol = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+          Set-Reg $tsPol "SelectTransport" 0
+          Set-Reg $tsPol "fClientDisableUDP" 0
+          Set-Reg $tsPol "AVC444ModePreferred" $avc444
+          Set-Reg $tsPol "VisualExperiencePolicy" 1
+          Set-Reg $tsPol "ColorDepth" $colorDepth
+          Set-Reg $tsPol "fResetBroken" 0
+          Set-Reg $tsPol "fDisableWallpaper" $wallpaperOff
+          # Tắt redirect thiết bị không dùng -> bớt overhead/lag (mic/âm thanh và USB vẫn giữ)
+          Set-Reg $tsPol "fDisableCcm" 1
+          Set-Reg $tsPol "fDisableLPT" 1
+          Set-Reg $tsPol "fDisableCam" 1
+          Set-Reg $tsPol "fDisableCpm" 1
+          Set-Reg $tsPol "fDisableSmartcard" 1
+
+          # --- MMCSS: ưu tiên cao cho game/app đồ hoạ ---
+          $games = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games"
+          Set-Reg $games "GPU Priority" 8
+          Set-Reg $games "Priority" 6
+          Set-Reg $games "Scheduling Category" "High" "String"
+          Set-Reg $games "SFIO Priority" "High" "String"
+          Set-Reg $games "Background Only" "False" "String"
+          Set-Reg $games "Clock Rate" 10000
+          Set-Reg $games "Affinity" 0
+          Set-Reg $games "Latency Sensitive" "True" "String"
+
+          # --- Tắt Game DVR/Game Bar tối ưu fullscreen (đỡ giật khi alt-tab) ---
+          Set-Reg "HKCU:\System\GameConfigStore" "GameDVR_FSEBehaviorMode" 2
+          Set-Reg "HKCU:\System\GameConfigStore" "GameDVR_HonorUserFSEBehaviorMode" 1
+          Set-Reg "HKCU:\System\GameConfigStore" "GameDVR_DXGIHonorFSEWindowsCompatible" 1
+          Set-Reg "HKCU:\System\GameConfigStore" "GameDVR_EFSEFeatureFlags" 0
+          Set-Reg "HKLM:\SOFTWARE\Microsoft\PolicyManager\default\ApplicationManagement\AllowGameDVR" "value" 0
+
+          # --- Mic: best-effort cho phép chuyển micro từ máy khách vào phiên RDP ---
+          # Windows Server mặc định chặn ghi âm; cần cả policy + RDP-Tcp + quyền riêng tư micro.
+          # Lưu ý: nếu server thiếu role RDSH hoặc phiên là admin, mic vẫn có thể không xuất hiện.
+          Set-Reg $tsPol "fDisableAudioCapture" 0
+          Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" "fDisableAudioCapture" 0
+          Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone" "Value" "Allow" "String"
+          Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone\NonPackaged" "Value" "Allow" "String"
+
+          # --- Không khoá màn hình / không tắt phiên khi rảnh ---
+          Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization" "NoLockScreen" 1
+          Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" "InactivityTimeoutSecs" 0
+          Set-Reg "HKCU:\Control Panel\Desktop" "ScreenSaveActive" "0" "String"
+          Set-Reg "HKCU:\Control Panel\Desktop" "ScreenSaverIsSecure" "0" "String"
+          powercfg /setacvalueindex SCHEME_CURRENT SUB_NONE CONSOLELOCK 0 2>$null
+          powercfg /setactive SCHEME_CURRENT
+
+          # --- Âm thanh: bật Windows Audio cho app cần loa/mic ---
+          foreach ($s in @("Audiosrv", "AudioEndpointBuilder")) {
+            Set-Service $s -StartupType Automatic -ErrorAction SilentlyContinue
+            Start-Service $s -ErrorAction SilentlyContinue
+          }
+
+          # --- Tắt service/tác vụ nền tốn CPU, mạng, ổ đĩa ---
+          foreach ($s in @("wuauserv", "UsoSvc", "DoSvc", "WaaSMedicSvc", "BITS", "WerSvc", "diagnosticshub.standardcollector.service", "MapsBroker", "RetailDemo", "XblAuthManager", "XblGameSave", "XboxNetApiSvc", "XboxGipSvc", "Spooler", "Fax", "RemoteRegistry", "PcaSvc", "TabletInputService", "WbioSrvc", "SensrSvc", "SensorService")) {
+            Stop-Service $s -Force -ErrorAction SilentlyContinue
+            Set-Service $s -StartupType Disabled -ErrorAction SilentlyContinue
+          }
+          $tasks = @(
+            "\Microsoft\Windows\Defrag\ScheduledDefrag",
+            "\Microsoft\Windows\Windows Defender\Windows Defender Scheduled Scan",
+            "\Microsoft\Windows\Application Experience\Microsoft Compatibility Appraiser",
+            "\Microsoft\Windows\Application Experience\ProgramDataUpdater",
+            "\Microsoft\Windows\Autochk\Proxy",
+            "\Microsoft\Windows\Customer Experience Improvement Program\Consolidator",
+            "\Microsoft\Windows\DiskDiagnostic\Microsoft-Windows-DiskDiagnosticDataCollector",
+            "\Microsoft\Windows\Feedback\Siuf\DmClient",
+            "\Microsoft\Windows\Feedback\Siuf\DmClientOnScenarioDownload",
+            "\Microsoft\Windows\Power Efficiency Diagnostics\AnalyzeSystem",
+            "\Microsoft\Windows\UpdateOrchestrator\Schedule Scan",
+            "\Microsoft\Windows\Windows Error Reporting\QueueReporting",
+            "\Microsoft\Windows\Diagnosis\Scheduled",
+            "\Microsoft\Windows\Maintenance\WinSAT"
+          )
+          foreach ($t in $tasks) { schtasks /Change /TN $t /Disable 2>$null | Out-Null }
+
+          # --- Defender: tắt thêm các lớp quét nặng ---
+          try {
+            Set-MpPreference -DisableBehaviorMonitoring $true -DisableIOAVProtection $true `
+              -DisableScriptScanning $true -DisableArchiveScanning $true -MAPSReporting 0 `
+              -SubmitSamplesConsent 2 -ErrorAction Stop
+          } catch { Write-Warning "Defender (lớp phụ): $($_.Exception.Message)" }
+
+          # --- Giao diện: bỏ widget, chat, tin tức, gợi ý để nhẹ hơn ---
+          $adv = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+          Set-Reg $adv "TaskbarAl" 0
+          Set-Reg $adv "TaskbarDa" 0
+          Set-Reg $adv "TaskbarMn" 0
+          Set-Reg $adv "ShowTaskViewButton" 0
+          Set-Reg $adv "HideFileExt" 0
+          Set-Reg $adv "Hidden" 1
+          Set-Reg "HKCU:\Software\Microsoft\Windows\CurrentVersion\Search" "SearchboxTaskbarMode" 0
+          Set-Reg "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-338388Enabled" 0
+          Set-Reg "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SilentInstalledAppsEnabled" 0
+          Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" "AllowNewsAndInterests" 0
+          Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot" "TurnOffWindowsCopilot" 1
+
+          # --- Giảm tải nền: app ngầm, OneDrive/Teams, tìm kiếm web, hiệu ứng ---
+          Set-Reg "HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications" "GlobalUserDisabled" 1
+          Set-Reg "HKCU:\Software\Microsoft\Windows\CurrentVersion\Search" "BackgroundAppGlobalToggle" 0
+          Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy" "LetAppsRunInBackground" 2
+          Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive" "DisableFileSyncNGSC" 1
+          Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search" "AllowCortana" 0
+          Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search" "DisableSearchBoxSuggestions" 1
+          Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Edge" "BackgroundModeEnabled" 0
+          Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Edge" "StartupBoostEnabled" 0
+          Set-Reg "HKCU:\Software\Policies\Microsoft\Windows\WindowsAI" "DisableAIDataAnalysis" 1
+          Set-Reg "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-338389Enabled" 0
+          Set-Reg "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-353694Enabled" 0
+          Set-Reg "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-353696Enabled" 0
+          Set-Reg "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SystemPaneSuggestionsEnabled" 0
+          Set-Reg "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SoftLandingEnabled" 0
+          Set-Reg $adv "Start_IrisRecommendations" 0
+          Set-Reg $adv "Start_TrackDocs" 0
+          foreach ($rv in @("OneDrive", "OneDriveSetup", "MicrosoftTeams")) {
+            Remove-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name $rv -ErrorAction SilentlyContinue
+          }
+          Set-Reg $adv "TaskbarAnimations" 0
+          Set-Reg $adv "ListviewAlphaSelect" 0
+          Set-Reg $adv "ListviewShadow" 0
+          Set-Reg $adv "DisallowShaking" 1
+          Set-Reg "HKCU:\Software\Microsoft\Windows\DWM" "EnableAeroPeek" 0
+          Set-Reg "HKCU:\Control Panel\Desktop" "MenuShowDelay" "20" "String"
+          Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling" "PowerThrottlingOff" 1
+
+          # --- Hiệu năng hệ thống: ưu tiên app đang dùng, giảm độ trễ game/app ---
+          Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl" "Win32PrioritySeparation" 38
+          Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" "SystemResponsiveness" 0
+          Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" "NetworkThrottlingIndex" -1
+          Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR" "AllowGameDVR" 0
+          Set-Reg "HKCU:\System\GameConfigStore" "GameDVR_Enabled" 0
+          Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management" "DisablePagingExecutive" 1
+          Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" "NtfsDisableLastAccessUpdate" 1
+          fsutil behavior set disablelastaccess 1 | Out-Null
+          fsutil behavior set disable8dot3 1 | Out-Null
+
+          # --- Ép dùng hết 4 core / 16 GB: không park core, CPU luôn 100%, boost tối đa ---
+          powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR 0cc5b647-c1df-4637-891a-dec35c318583 100 2>$null
+          powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR ea062031-0e34-4ff1-9b6d-eb1059334028 100 2>$null
+          powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMIN 100 2>$null
+          powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMAX 100 2>$null
+          powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR be337238-0d82-4146-a960-4f3749d470c7 2 2>$null
+          powercfg /setacvalueindex SCHEME_CURRENT SUB_SLEEP STANDBYIDLE 0 2>$null
+          powercfg /setactive SCHEME_CURRENT
+
+          # RAM >= 24 GB: tắt nén bộ nhớ để đỡ tốn CPU. RAM 16 GB (hoặc ít hơn): giữ nén để tránh paging/giật.
+          $ramGB = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1)
+          if ($ramGB -ge 24) {
+            try { Disable-MMAgent -MemoryCompression -PageCombining -ErrorAction Stop } catch {
+              Write-Warning "MMAgent (tắt nén): $($_.Exception.Message)"
+            }
+          } else {
+            try { Enable-MMAgent -MemoryCompression -PageCombining -ErrorAction Stop } catch {
+              Write-Warning "MMAgent (giữ nén): $($_.Exception.Message)"
+            }
+          }
+
+          # Ghi lại cấu hình thực tế sau tối ưu
+          try {
+            $cpu2 = Get-CimInstance Win32_Processor | Select-Object -First 1
+            $ram2 = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1)
+            $freeRam = [math]::Round((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1MB, 1)
+            $line = "CPU: $($cpu2.NumberOfLogicalProcessors) luồng | RAM: $ram2 GB (trống $freeRam GB)"
+            Write-Host $line
+            Add-Content -Path $env:GITHUB_ENV -Value "HW_STATUS=$line"
+          } catch { }
+
+          # --- Dọn thêm: SoftwareDistribution, log, thùng rác ---
+          Remove-Item "$env:SystemRoot\SoftwareDistribution\Download\*" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item "$env:SystemRoot\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue
+          Clear-RecycleBin -Force -ErrorAction SilentlyContinue
+          Write-Host "Tối ưu xong."
+
+          # Dọn temp cho rộng ổ đĩa (chỉ 14 GB)
+          Remove-Item "$env:TEMP\*" -Recurse -Force -ErrorAction SilentlyContinue
+          Get-PSDrive C | ForEach-Object { Write-Host ("Ổ C còn trống: {0} GB" -f [math]::Round($_.Free / 1GB, 1)) }
+
+          # Lệnh native (powercfg, schtasks...) có thể để lại exit code 1 làm step báo lỗi: ép về 0
+          exit 0
+
+      - name: 5b. Hình nền
+        shell: pwsh
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          $ErrorActionPreference = "Continue"
+          $PSNativeCommandUseErrorActionPreference = $false
+          $ProgressPreference = "SilentlyContinue"
+
+          $dir = "C:\Users\Public\Pictures"
+          New-Item -ItemType Directory -Path $dir -Force | Out-Null
+          $img = Join-Path $dir "wallpaper.jpg"
+          $id = "1XzZWRCx9T8i6id-h266I19FGmDyzp0-K"
+          $urls = @(
+            "https://drive.usercontent.google.com/download?id=$id&export=download",
+            "https://drive.google.com/uc?export=download&id=$id"
+          )
+
+          $ok = $false
+          foreach ($u in $urls) {
+            for ($i = 1; $i -le 3 -and -not $ok; $i++) {
+              try {
+                Invoke-WebRequest -Uri $u -OutFile $img -MaximumRedirection 10 `
+                  -Headers @{ "User-Agent" = "Mozilla/5.0" } -ErrorAction Stop
+                $b = [System.IO.File]::ReadAllBytes($img)
+                if ($b.Length -gt 10KB -and $b[0] -eq 0xFF -and $b[1] -eq 0xD8) {
+                  $ok = $true
+                } else {
+                  throw "File tải về không phải JPEG."
+                }
+              } catch {
+                Write-Warning "Tải hình nền lỗi (lần $i): $($_.Exception.Message)"
+                Start-Sleep -Seconds 5
+              }
+            }
+            if ($ok) { break }
+          }
+
+          if (-not $ok) {
+            Write-Warning "Không tải được hình nền; giữ hình mặc định."
+            Add-Content -Path $env:GITHUB_ENV -Value "WALLPAPER_STATUS=LỖI (giữ hình mặc định)"
+            exit 0
+          }
+
+          # Xoá policy chặn đổi hình nền (nếu có)
+          Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\ActiveDesktop" `
+            -Name "NoChangingWallPaper" -ErrorAction SilentlyContinue
+          Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\System" `
+            -Name "Wallpaper" -ErrorAction SilentlyContinue
+
+          $desk = "HKCU:\Control Panel\Desktop"
+          Set-ItemProperty -Path $desk -Name "Wallpaper" -Value $img -Type String
+          Set-ItemProperty -Path $desk -Name "WallpaperStyle" -Value "10" -Type String  # 10 = Fill
+          Set-ItemProperty -Path $desk -Name "TileWallpaper" -Value "0" -Type String
+
+          $applied = $false
+          try {
+            if (-not ("WallpaperApi" -as [type])) {
+              Add-Type -TypeDefinition @'
+          using System;
+          using System.Runtime.InteropServices;
+          public class WallpaperApi {
+            [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+            public static extern bool SystemParametersInfo(int uAction, int uParam, string lpvParam, int fuWinIni);
+          }
+          '@
+            }
+            # SPI_SETDESKWALLPAPER = 20; SPIF_UPDATEINIFILE | SPIF_SENDCHANGE = 3
+            $applied = [WallpaperApi]::SystemParametersInfo(20, 0, $img, 3)
+          } catch {
+            Write-Warning "Không gọi được SystemParametersInfo: $($_.Exception.Message)"
+          }
+          if ($applied) {
+            Write-Host "Đã đặt hình nền: $img (Fill)"
+            Add-Content -Path $env:GITHUB_ENV -Value "WALLPAPER_STATUS=OK (Fill)"
+          } else {
+            # Registry vẫn được lưu; Windows sẽ áp dụng ở lần đăng nhập sau
+            Write-Warning "SPI trả về false; đã lưu registry, sẽ áp dụng khi đăng nhập lại."
+            Add-Content -Path $env:GITHUB_ENV -Value "WALLPAPER_STATUS=đã lưu (áp dụng khi login)"
+          }
+          exit 0
+
+      - name: 6. Cài Vulkan và app tối ưu
+        shell: pwsh
+        continue-on-error: true
+        timeout-minutes: 30
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          $ErrorActionPreference = "Continue"
+          $PSNativeCommandUseErrorActionPreference = $false
+          $ProgressPreference = "SilentlyContinue"
+          $isArm = ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") -or ((Get-CimInstance Win32_OperatingSystem).OSArchitecture -match "ARM")
+          $results = @()
+          $t0 = Get-Date
+
+          function Invoke-Retry {
+            param([scriptblock]$Action, [int]$Count = 3, [int]$DelaySec = 5)
+            for ($i = 1; $i -le $Count; $i++) {
+              try { return (& $Action) }
+              catch {
+                if ($i -ge $Count) { throw }
+                Write-Warning "Lần $i/$Count lỗi: $($_.Exception.Message) - thử lại sau $DelaySec giây..."
+                Start-Sleep -Seconds $DelaySec
+              }
+            }
+          }
+
+          # --- Vulkan runtime (runner không có GPU nên chạy bằng CPU/software) ---
+          if ($isArm) {
+            Write-Host "Windows ARM64: dùng Mesa lavapipe + Vulkan loader ARM64 (cài ở bước 7)."
+            $results += "Vulkan: loader ARM64 (bước 7)"
+          } else {
+            $vkOk = $false
+            # Gói choco "vulkan-runtime" không tồn tại; URL "latest" cũ đã bị LunarG bỏ (404).
+            # Ghim bản runtime cuối 1.4.304.0; nếu lỗi, bước 7 sẽ tự lấy loader từ NuGet.
+            $vk = "$env:TEMP\vulkan-runtime.exe"
+            try {
+              Invoke-Retry {
+                Invoke-WebRequest -Uri "https://sdk.lunarg.com/sdk/download/1.4.304.0/windows/vulkan-runtime.exe" `
+                  -OutFile $vk -MaximumRedirection 10 -Headers @{ "User-Agent" = "Mozilla/5.0" } -ErrorAction Stop
+              } | Out-Null
+              $p = Start-Process $vk -ArgumentList "/S" -PassThru
+              if ($p.WaitForExit(300000) -and $p.ExitCode -in @(0, 1641, 3010)) {
+                $vkOk = $true
+              } elseif (-not $p.HasExited) {
+                $p.Kill()
+              }
+            } catch { Write-Warning "Tải Vulkan lỗi: $($_.Exception.Message)" }
+            if (Test-Path "$env:SystemRoot\System32\vulkan-1.dll") { $vkOk = $true }
+            $results += "Vulkan runtime: $(if ($vkOk) { 'OK' } else { 'LỖI' })"
+          }
+
+          # --- App tối ưu / tiện ích (mỗi app lỗi không ảnh hưởng app khác) ---
+          # Mặc định chỉ cài bộ nhanh; app nặng chỉ cài khi install_extra = true.
+          # Chỉ dùng ID có thật trên Chocolatey; presentmon tải trực tiếp ở bước 6c.
+          $full = "$env:INSTALL_EXTRA" -eq "true"
+          $apps = @("7zip", "vcredist-all", "directx", "unikey", "imdisk-toolkit")
+          if (-not [string]::IsNullOrWhiteSpace($env:RCLONE_CONF)) {
+            $apps += @("rclone", "winfsp")
+          } else {
+            $results += "rclone/winfsp: bỏ qua (chưa có secret RCLONE_CONF)"
+          }
+          if ($full) {
+            $apps += @("shutup10", "winaero-tweaker", "bleachbit", "rainmeter", "processhacker", "vb-cable", "firefox", "brave", "sharex", "aria2", "yt-dlp", "ffmpeg")
+          }
+          if ($full -and -not $isArm) {
+            # SDK đầy đủ để có vulkaninfo.exe kiểm tra GPU ảo (nặng, chỉ cài khi install_extra=true)
+            $apps += @("vulkan-sdk")
+          }
+          $results += "Chế độ app: $(if ($full) { 'đầy đủ (install_extra=true)' } else { 'nhanh (chỉ app thiết yếu)' })"
+          if (Get-Command choco -ErrorAction SilentlyContinue) {
+            foreach ($a in $apps) {
+              Write-Host "=== choco install $a ==="
+              choco install $a -y --no-progress --limit-output 2>&1 | ForEach-Object { Write-Host $_ }
+              $results += "${a}: $(if ($LASTEXITCODE -in @(0, 1641, 3010)) { 'OK' } else { 'LỖI' })"
+            }
+          } else {
+            $results += "choco không có: bỏ qua app tối ưu"
+          }
+
+          $results += "Thời gian bước 6: $([int]((Get-Date) - $t0).TotalSeconds) giây"
+          $results | ForEach-Object { Write-Host $_ }
+          Add-Content -Path $env:GITHUB_ENV -Value "EXTRA_STATUS=$($results -join ' | ')"
+          exit 0
+
+      - name: 6b. Màn hình ảo, RAM disk, tiếng Việt, mạng
+        shell: pwsh
+        continue-on-error: true
+        timeout-minutes: 20
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          $ErrorActionPreference = "Continue"
+          $PSNativeCommandUseErrorActionPreference = $false
+          $ProgressPreference = "SilentlyContinue"
+          $res = @()
+
+          function Invoke-Retry {
+            param([scriptblock]$Action, [int]$Count = 3, [int]$DelaySec = 5)
+            for ($i = 1; $i -le $Count; $i++) {
+              try { return (& $Action) }
+              catch {
+                if ($i -ge $Count) { throw }
+                Write-Warning "Lần $i/$Count lỗi: $($_.Exception.Message) - thử lại sau $DelaySec giây..."
+                Start-Sleep -Seconds $DelaySec
+              }
+            }
+          }
+
+          function Set-Reg([string]$Path, [string]$Name, $Value, [string]$Type = "DWord") {
+            try {
+              if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
+              Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type $Type -ErrorAction Stop
+            } catch { Write-Warning "Reg $Path\$Name lỗi: $($_.Exception.Message)" }
+          }
+
+          # --- Vùng Việt Nam (định dạng ngày giờ, số) ---
+          try { Set-Culture vi-VN; Set-WinHomeLocation -GeoId 251; $res += "Vùng VN: OK" } catch { $res += "Vùng VN: LỖI" }
+
+          # --- Bỏ hỏi UAC / SmartScreen (máy tạm) ---
+          Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" "ConsentPromptBehaviorAdmin" 0
+          Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System" "EnableSmartScreen" 0
+          Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer" "SmartScreenEnabled" "Off" "String"
+
+          # --- Màn hình ảo độ phân giải cao (Virtual Display Driver) ---
+          # Driver x64 không nạp được trên Windows 11 ARM64 nên bỏ qua
+          $isArm = ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") -or ($env:PROCESSOR_ARCHITEW6432 -eq "ARM64") -or ((Get-CimInstance Win32_OperatingSystem).OSArchitecture -match "ARM")
+          if ($isArm) { $res += "Màn hình ảo: bỏ qua trên ARM64" } else {
+          try {
+            if (Get-Command winget -ErrorAction SilentlyContinue) {
+              winget install --id=VirtualDrivers.Virtual-Display-Driver -e --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1 | ForEach-Object { Write-Host $_ }
+              Start-Sleep -Seconds 5
+            }
+            $dev = Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.FriendlyName -match "Virtual Display|IddSample|MttVDD" } | Select-Object -First 1
+            if (-not $dev) {
+              # winget không cài được (hoặc cài nhưng chưa thấy thiết bị) -> chạy script cài trực tiếp
+              $sc = "$env:TEMP\vdd-silent-install.ps1"
+              Invoke-Retry {
+                Invoke-WebRequest -Uri "https://raw.githubusercontent.com/VirtualDrivers/Virtual-Display-Driver/master/Community%20Scripts/silent-install.ps1" `
+                  -OutFile $sc -Headers @{ "User-Agent" = "Mozilla/5.0" } -ErrorAction Stop
+              } | Out-Null
+              # Script VDD dùng -Encoding Byte (chỉ Windows PowerShell 5.1 hỗ trợ), không chạy bằng pwsh 7
+              $p = Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$sc`"" -PassThru -WindowStyle Hidden
+              if (-not $p.WaitForExit(300000)) { taskkill /PID $p.Id /T /F 2>&1 | Out-Null }
+              Start-Sleep -Seconds 5
+              $dev = Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.FriendlyName -match "Virtual Display|IddSample|MttVDD" } | Select-Object -First 1
+            }
+            if ($dev) { $res += "Màn hình ảo: OK" } else { $res += "Màn hình ảo: chưa thấy thiết bị" }
+          } catch { $res += "Màn hình ảo: LỖI"; Write-Warning $_.Exception.Message }
+          }
+
+          # --- RAM disk cho file tạm và cache: 4 GB (16 GB RAM), 2 GB (8 GB), 1 GB (ít hơn) ---
+          if ($isArm) { $res += "RAM disk: bỏ qua trên ARM64" } else {
+          try {
+            $im = Get-Command imdisk.exe -ErrorAction SilentlyContinue
+            if ($im) {
+              $ramGB = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 0)
+              $rdGB = if ($ramGB -ge 15) { 4 } elseif ($ramGB -ge 7) { 2 } else { 1 }
+              & $im.Source -a -s "${rdGB}G" -m R: -p "/fs:ntfs /q /y" 2>&1 | ForEach-Object { Write-Host $_ }
+              if (Test-Path "R:\") {
+                New-Item -ItemType Directory -Path "R:\Temp" -Force | Out-Null
+                [Environment]::SetEnvironmentVariable("TEMP", "R:\Temp", "Machine")
+                [Environment]::SetEnvironmentVariable("TMP", "R:\Temp", "Machine")
+                $res += "RAM disk R: ${rdGB}GB OK"
+              } else { $res += "RAM disk: không tạo được" }
+            } else { $res += "RAM disk: thiếu ImDisk" }
+          } catch { $res += "RAM disk: LỖI" }
+          }
+
+          # --- rclone mount (chỉ khi có secret RCLONE_CONF) ---
+          if (-not [string]::IsNullOrWhiteSpace($env:RCLONE_CONF)) {
+            try {
+              $dir = "$env:APPDATA\rclone"
+              New-Item -ItemType Directory -Path $dir -Force | Out-Null
+              Set-Content -Path "$dir\rclone.conf" -Value $env:RCLONE_CONF -Encoding UTF8
+              $remote = (Select-String -Path "$dir\rclone.conf" -Pattern '^\[(.+)\]' | Select-Object -First 1).Matches.Groups[1].Value
+              $rc = (Get-Command rclone.exe -ErrorAction SilentlyContinue).Source
+              if ($remote -and $rc) {
+                Start-Process $rc -ArgumentList "mount ${remote}: Z: --vfs-cache-mode full --no-console" -WindowStyle Hidden
+                Start-Sleep -Seconds 8
+                $res += "rclone Z: $(if (Test-Path 'Z:\') { 'OK' } else { 'chưa gắn được' })"
+              } else { $res += "rclone: thiếu remote hoặc rclone" }
+            } catch { $res += "rclone: LỖI" }
+          } else { $res += "rclone: bỏ qua (chưa có secret RCLONE_CONF)" }
+
+          # --- Tailscale: đo đường đi tới relay ---
+          $tsx = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (Test-Path $tsx) { & $tsx netcheck 2>&1 | Select-Object -First 25 | ForEach-Object { Write-Host $_ } }
+
+          $res | ForEach-Object { Write-Host $_ }
+          Add-Content -Path $env:GITHUB_ENV -Value "UTIL_STATUS=$($res -join ' | ')"
+          exit 0
+
+      - name: 6b2. Đổi tên GPU hiển thị (RTX 5090 - chỉ là nhãn)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $fake = "NVIDIA GeForce RTX 5090"
+          $ErrorActionPreference = "Continue"
+          $changed = 0
+
+          # Ưu tiên Virtual Display Driver vừa cài; nếu không có thì lấy adapter đang hoạt động
+          $dev = Get-PnpDevice -Class Display -ErrorAction SilentlyContinue |
+            Where-Object { $_.FriendlyName -match "Virtual Display|IddSample|MttVDD" } |
+            Select-Object -First 1
+          if (-not $dev) {
+            $dev = Get-PnpDevice -Class Display -Status OK -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+          }
+          if (-not $dev) {
+            Write-Warning "Không thấy adapter hiển thị để đổi tên."
+            exit 0
+          }
+          $origName = $dev.FriendlyName
+          Write-Host "Adapter gốc: $origName ($($dev.InstanceId))"
+
+          # 1) FriendlyName: Device Manager ưu tiên tên này
+          $enum = "HKLM:\SYSTEM\CurrentControlSet\Enum\$($dev.InstanceId)"
+          try {
+            New-ItemProperty -Path $enum -Name "FriendlyName" -Value $fake `
+              -PropertyType String -Force -ErrorAction Stop | Out-Null
+            $changed++
+          } catch { Write-Warning "Không đổi được FriendlyName: $($_.Exception.Message)" }
+
+          # 2) DriverDesc của class Display: một số app/WMI đọc tên này
+          $class = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+          Get-ChildItem $class -ErrorAction SilentlyContinue | ForEach-Object {
+            $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+            if (-not $p.DriverDesc) { return }
+            $match = (
+              ($p.DriverDesc -eq $origName) -or
+              ($p.MatchingDeviceId -and $dev.InstanceId.StartsWith($p.MatchingDeviceId, [StringComparison]::OrdinalIgnoreCase))
+            )
+            if (-not $match) { return }
+            try {
+              Set-ItemProperty -Path $_.PSPath -Name "DriverDesc" -Value $fake -Type String -ErrorAction Stop
+              $changed++
+            } catch { Write-Warning "Không đổi được DriverDesc: $($_.Exception.Message)" }
+          }
+
+          # 3) Control\Video: một số bản dxdiag đọc tên ở đây
+          Get-ChildItem "HKLM:\SYSTEM\CurrentControlSet\Control\Video" -ErrorAction SilentlyContinue | ForEach-Object {
+            Get-ChildItem $_.PSPath -ErrorAction SilentlyContinue | ForEach-Object {
+              $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+              if ($p.DriverDesc -and $p.DriverDesc -eq $origName) {
+                try {
+                  Set-ItemProperty -Path $_.PSPath -Name "DriverDesc" -Value $fake -Type String -ErrorAction Stop
+                  $changed++
+                } catch { }
+              }
+            }
+          }
+
+          if ($changed -gt 0) {
+            Add-Content -Path $env:GITHUB_ENV -Value "GPU_FAKE=$fake"
+            Write-Host "Đã đổi tên hiển thị GPU thành $fake (chỉ là nhãn, hiệu năng vẫn bằng CPU)."
+          } else {
+            Write-Warning "Không đổi được tên GPU; có thể cần quyền cao hơn."
+          }
+          exit 0
+
+      - name: 6c. App xem FPS/RAM và file tối ưu trên Desktop
+        shell: pwsh
+        continue-on-error: true
+        timeout-minutes: 20
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Continue"
+          $PSNativeCommandUseErrorActionPreference = $false
+          $ProgressPreference = "SilentlyContinue"
+          $res = @()
+          $t0 = Get-Date
+
+          function Invoke-Retry {
+            param([scriptblock]$Action, [int]$Count = 3, [int]$DelaySec = 5)
+            for ($i = 1; $i -le $Count; $i++) {
+              try { return (& $Action) }
+              catch {
+                if ($i -ge $Count) { throw }
+                Write-Warning "Lần $i/$Count lỗi: $($_.Exception.Message) - thử lại sau $DelaySec giây..."
+                Start-Sleep -Seconds $DelaySec
+              }
+            }
+          }
+
+          # --- App xem FPS / RAM / CPU / ổ đĩa (mỗi app lỗi không ảnh hưởng app khác) ---
+          # MSI Afterburner + RTSS được cài ở cả chế độ nhanh để có app xem FPS.
+          # Bộ công cụ nặng chỉ cài khi install_extra = true.
+          # capframex không có gói Chocolatey/winget -> dùng PresentMon hoặc RTSS.
+          $full = "$env:INSTALL_EXTRA" -eq "true"
+          $tools = @("msiafterburner")
+          if ($full) { $tools += @("hwinfo", "cpu-z", "gpu-z", "memreduct", "sysinternals", "wiztree", "crystaldiskmark") }
+          $res += "Chế độ app FPS/RAM: $(if ($full) { 'đầy đủ (install_extra=true)' } else { 'nhanh' }) - có MSI Afterburner/RTSS + PresentMon"
+          if ($tools.Count -gt 0) {
+            if (Get-Command choco -ErrorAction SilentlyContinue) {
+              foreach ($t in $tools) {
+                Write-Host "=== choco install $t ==="
+                choco install $t -y --no-progress --limit-output 2>&1 | ForEach-Object { Write-Host $_ }
+                $res += "${t}: $(if ($LASTEXITCODE -in @(0, 1641, 3010)) { 'OK' } else { 'LỖI' })"
+              }
+            } else {
+              $res += "choco không có: bỏ qua app xem FPS/RAM"
+            }
+          } else {
+            $res += "App phần cứng nặng: bỏ qua (bật install_extra để cài)"
+          }
+
+          # --- PresentMon (Intel): exe portable, không cần cài đặt ---
+          try {
+            $pmHdr = @{ "User-Agent" = "gh-actions" }
+            if ($env:GH_TOKEN) { $pmHdr["Authorization"] = "Bearer $env:GH_TOKEN" }
+            $pmRel = Invoke-Retry {
+              Invoke-RestMethod "https://api.github.com/repos/GameTechDev/PresentMon/releases/latest" -Headers $pmHdr -ErrorAction Stop
+            }
+            $pm = $pmRel.assets | Where-Object { $_.name -match '^PresentMon-.*-x64\.exe$' } | Select-Object -First 1
+            if ($pm) {
+              $pmDir = "C:\Tools\PresentMon"
+              New-Item -ItemType Directory -Path $pmDir -Force | Out-Null
+              Invoke-Retry {
+                Invoke-WebRequest -Uri $pm.browser_download_url -OutFile (Join-Path $pmDir "PresentMon.exe") `
+                  -MaximumRedirection 10 -Headers @{ "User-Agent" = "Mozilla/5.0" } -ErrorAction Stop
+              } | Out-Null
+              Unblock-File -Path (Join-Path $pmDir "PresentMon.exe") -ErrorAction SilentlyContinue
+              $res += "PresentMon: OK (C:\Tools\PresentMon)"
+            } else {
+              $res += "PresentMon: không thấy bản x64"
+            }
+          } catch {
+            $res += "PresentMon: LỖI"
+            Write-Warning "PresentMon: $($_.Exception.Message)"
+          }
+
+          # --- File tối ưu + theo dõi đặt ngoài Desktop (Public Desktop: user nào cũng thấy) ---
+          $desk = Join-Path $env:PUBLIC "Desktop"
+          New-Item -ItemType Directory -Path $desk -Force | Out-Null
+
+          # --- Shortcut MSI Afterburner / RTSS để xem FPS ngay trên Desktop ---
+          function New-DesktopShortcut {
+            param([string]$Name, [string]$Target, [string]$WorkDir = "", [string]$Desc = "")
+            if (-not (Test-Path $Target)) { return $false }
+            try {
+              $ws = New-Object -ComObject WScript.Shell
+              $lnk = $ws.CreateShortcut((Join-Path $desk $Name))
+              $lnk.TargetPath = $Target
+              if ($WorkDir) { $lnk.WorkingDirectory = $WorkDir }
+              if ($Desc) { $lnk.Description = $Desc }
+              $lnk.Save()
+              return $true
+            } catch {
+              Write-Warning "Tạo shortcut $Name lỗi: $($_.Exception.Message)"
+              return $false
+            }
+          }
+
+          $pf = $env:ProgramFiles
+          $pf86 = [Environment]::GetFolderPath("ProgramFilesX86")
+          if (-not $pf86) { $pf86 = ${env:ProgramFiles(x86)} }
+          if (-not $pf86) { $pf86 = $pf }
+          $msiExe = @(
+            (Join-Path $pf "MSI Afterburner\MSIAfterburner.exe"),
+            (Join-Path $pf86 "MSI Afterburner\MSIAfterburner.exe")
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          $rtssExe = @(
+            (Join-Path $pf "RivaTuner Statistics Server\RTSS.exe"),
+            (Join-Path $pf86 "RivaTuner Statistics Server\RTSS.exe")
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+          $msiSc = if ($msiExe) {
+            New-DesktopShortcut "MSI Afterburner.lnk" $msiExe (Split-Path $msiExe -Parent) "MSI Afterburner - xem FPS/GPU"
+          } else { $false }
+          $rtssSc = if ($rtssExe) {
+            New-DesktopShortcut "RTSS FPS.lnk" $rtssExe (Split-Path $rtssExe -Parent) "RivaTuner - hiện FPS trong game"
+          } else { $false }
+
+          if ($msiSc -or $rtssSc) {
+            $res += "Shortcut FPS: MSI Afterburner $(if ($msiSc) { 'OK' } else { 'thiếu' }), RTSS $(if ($rtssSc) { 'OK' } else { 'thiếu' })"
+          } else {
+            $res += "Shortcut FPS: chưa thấy MSI Afterburner/RTSS"
+          }
+
+          # Luôn có hướng dẫn, kể cả khi cài Afterburner lỗi (PresentMon vẫn dùng được)
+          $readme = @(
+            "XEM FPS TRÊN MÁY ẢO",
+            "",
+            "CÁCH 1 - MSI Afterburner + RTSS (nếu có shortcut trên Desktop):",
+            "1. Bấm đúp 'RTSS FPS' để bật RivaTuner (chạy nền, icon dưới khay).",
+            "2. Bấm đúp 'MSI Afterburner'.",
+            "3. Trong Afterburner: Settings (bánh răng) > On-Screen Display > chọn FPS/Framerate > Apply.",
+            "4. Vào game/app, RTSS sẽ hiện FPS ở góc màn hình.",
+            "",
+            "CÁCH 2 - PresentMon (chính xác hơn khi RTSS không hook được game):",
+            "  C:\Tools\PresentMon\PresentMon.exe --process_name TenGame.exe --terminate_on_proc_exit --restart_as_admin",
+            "  (thay TenGame.exe bằng tên tiến trình game, ví dụ RobloxPlayerBeta.exe)",
+            "",
+            "Lưu ý: máy ảo không có GPU thật; Afterburner không xem được nhiệt độ/GPU thật.",
+            "Nhật ký tối ưu: C:\Tools\toi-uu-pc.log"
+          ) -join "`r`n"
+          Set-Content -Path (Join-Path $desk "Huong-dan-xem-FPS.txt") -Value $readme -Encoding utf8BOM
+
+          $optPs1 = @'
+          # Toi-uu-PC.ps1 - giải phóng RAM, ép hiệu năng cao, dọn rác. Chạy lại bất cứ lúc nào.
+          # Chạy ẩn qua Toi-uu-PC.vbs; nhật ký ở C:\Tools\toi-uu-pc.log
+          $ErrorActionPreference = "SilentlyContinue"
+          $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+          if (-not $isAdmin) {
+            # Tự mở lại bằng quyền admin nhưng ẩn cửa sổ (chỉ hiện hộp thoại UAC nếu Windows hỏi)
+            Start-Process powershell.exe -Verb RunAs -WindowStyle Hidden `
+              -ArgumentList "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`""
+            exit
+          }
+
+          # Chống chạy trùng: bấm nhiều lần cũng chỉ có một tiến trình tối ưu
+          $created = $false
+          try { $mutex = [System.Threading.Mutex]::new($true, "Local\ToiUuPC", [ref]$created) } catch { $created = $true }
+          if (-not $created) { exit }
+
+          $log = "C:\Tools\toi-uu-pc.log"
+          New-Item -ItemType Directory -Path "C:\Tools" -Force | Out-Null
+          try {
+            if ((Test-Path $log) -and ((Get-Item $log).Length -gt 1MB)) { Remove-Item $log -Force }
+            Start-Transcript -Path $log -Append -Force | Out-Null
+          } catch { }
+
+          function Get-RamInfo {
+            $o = Get-CimInstance Win32_OperatingSystem
+            [pscustomobject]@{
+              FreeGB  = [math]::Round($o.FreePhysicalMemory / 1MB, 2)
+              TotalGB = [math]::Round($o.TotalVisibleMemorySize / 1MB, 2)
+            }
+          }
+
+          $before = Get-RamInfo
+          Write-Host "=== TỐI ƯU PC ===" -ForegroundColor Cyan
+          Write-Host "RAM trống trước: $($before.FreeGB) / $($before.TotalGB) GB"
+
+          # 1. Chế độ nguồn High performance
+          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c | Out-Null
+          Write-Host "[1] Đã bật chế độ nguồn High performance"
+
+          # 2. Tắt app nền thừa (không dùng taskkill /IM để tránh nháy cmd)
+          $bloat = "OneDrive", "Teams", "ms-teams", "Widgets", "WidgetService", "YourPhone", "PhoneExperienceHost", "GameBar", "GameBarPresenceWriter", "Cortana"
+          foreach ($n in $bloat) {
+            Get-Process -Name $n -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          }
+          Write-Host "[2] Đã tắt app nền thừa"
+
+          # 3. Chỉ thu nhỏ working set của tiến trình lớn; bỏ qua app đang dùng và tiến trình hệ thống
+          if (-not ([System.Management.Automation.PSTypeName]'Win32.Mem').Type) {
+            Add-Type -Namespace Win32 -Name Mem -MemberDefinition '[DllImport("psapi.dll")] public static extern bool EmptyWorkingSet(System.IntPtr h);'
+          }
+          $skip = @("Idle", "System", "Registry", "Memory Compression", "csrss", "wininit", "services", "lsass", "smss", "winlogon", "dwm", "explorer", "powershell", "pwsh", "WmiPrvSE", "RobloxStudioBeta", "Discord", "WindowsTerminal", "StartMenuExperienceHost", "SearchHost", "ShellExperienceHost", "TextInputHost", "ApplicationFrameHost", "LockApp", "MsMpEng")
+          $trimmed = 0
+          foreach ($p in Get-Process | Where-Object { $_.WorkingSet64 -gt 250MB }) {
+            if ($skip -contains $p.Name) { continue }
+            $hasWin = $false
+            try { $hasWin = ($p.MainWindowHandle -ne 0) } catch { }
+            if ($hasWin) { continue }   # bỏ qua app đang mở cửa sổ
+            try { if ([Win32.Mem]::EmptyWorkingSet($p.Handle)) { $trimmed++ } } catch { }
+          }
+          Write-Host "[3] Đã thu nhỏ working set cho $trimmed tiến trình lớn (bỏ qua app đang dùng)"
+
+          # 4. RAMMap: xả working set + standby list (nếu có sysinternals)
+          $exeName = if (($env:PROCESSOR_ARCHITECTURE -eq "ARM64") -or ($env:PROCESSOR_ARCHITEW6432 -eq "ARM64")) { "RAMMap64a.exe" } else { "RAMMap64.exe" }
+          $rm = Get-Command $exeName
+          if (-not $rm) { $rm = Get-ChildItem "$env:ProgramData\chocolatey\lib\sysinternals\tools" -Filter $exeName -Recurse | Select-Object -First 1 }
+          if ($rm -and $before.FreeGB -lt 3) {
+            $rmPath = if ($rm.Source) { $rm.Source } else { $rm.FullName }
+            New-Item -Path "HKCU:\Software\Sysinternals\RAMMap" -Force | Out-Null
+            Set-ItemProperty -Path "HKCU:\Software\Sysinternals\RAMMap" -Name "EulaAccepted" -Value 1 -Type DWord
+            & $rmPath -Ew | Out-Null
+            & $rmPath -Et | Out-Null
+            Write-Host "[4] RAMMap đã xả working set và standby list"
+          } elseif ($rm) {
+            Write-Host "[4] Bỏ qua RAMMap (RAM còn trống $($before.FreeGB) GB)"
+          } else {
+            Write-Host "[4] Bỏ qua RAMMap (chưa cài sysinternals)"
+          }
+
+          # 5. Mem Reduct (nếu có) - chạy ẩn, không mở cửa sổ
+          $mr = "$env:ProgramFiles\Mem Reduct\memreduct.exe"
+          if (Test-Path $mr) {
+            Start-Process -FilePath $mr -ArgumentList "-clean" -WindowStyle Hidden -Wait
+            Write-Host "[5] Mem Reduct đã dọn RAM"
+          }
+
+          # 6. Dọn rác + DNS
+          Remove-Item "$env:TEMP\*" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item "$env:SystemRoot\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue
+          Clear-RecycleBin -Force -ErrorAction SilentlyContinue
+          ipconfig /flushdns | Out-Null
+          Write-Host "[6] Đã dọn rác và xoá cache DNS"
+
+          Start-Sleep -Seconds 2
+          $after = Get-RamInfo
+          Write-Host ("RAM trống sau: {0} / {1} GB (thêm {2} GB)" -f $after.FreeGB, $after.TotalGB, [math]::Round($after.FreeGB - $before.FreeGB, 2)) -ForegroundColor Green
+          Write-Host "Top 8 tiến trình tốn RAM:"
+          Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 8 Name, @{ N = "RAM_MB"; E = { [math]::Round($_.WorkingSet64 / 1MB) } } | Format-Table -AutoSize
+          Write-Host "Nhật ký: $log" -ForegroundColor DarkGray
+          Write-Host "Cửa sổ tự đóng sau 5 giây..." -ForegroundColor DarkGray
+          try { Stop-Transcript | Out-Null } catch { }
+          Start-Sleep -Seconds 5
+          try { $mutex.ReleaseMutex() } catch { }
+          '@
+
+          $monPs1 = @'
+          # Xem-FPS-RAM.ps1 - bảng theo dõi CPU / RAM / ổ đĩa / mạng theo thời gian thực (Ctrl+C để thoát)
+          $ErrorActionPreference = "SilentlyContinue"
+          function Get-Bar([double]$pct) {
+            $n = [int][math]::Round([math]::Min(100, [math]::Max(0, $pct)) / 5)
+            ("#" * $n) + ("-" * (20 - $n))
+          }
+          while ($true) {
+            $os      = Get-CimInstance Win32_OperatingSystem
+            $totalGB = [math]::Round($os.TotalVisibleMemorySize / 1MB, 1)
+            $usedGB  = [math]::Round(($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / 1MB, 1)
+            $ramPct  = [math]::Round($usedGB / $totalGB * 100)
+            $cpu     = (Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -Filter "Name='_Total'").PercentProcessorTime
+            $disk    = (Get-CimInstance Win32_PerfFormattedData_PerfDisk_PhysicalDisk -Filter "Name='_Total'").DiskBytesPersec
+            $net     = (Get-CimInstance Win32_PerfFormattedData_Tcpip_NetworkInterface | Measure-Object BytesTotalPersec -Sum).Sum
+            $free    = [math]::Round((Get-PSDrive C).Free / 1GB, 1)
+
+            Clear-Host
+            Write-Host "=== THEO DÕI MÁY (cập nhật mỗi 2 giây) ===" -ForegroundColor Cyan
+            Write-Host ("CPU  [{0}] {1} %" -f (Get-Bar $cpu), $cpu)
+            Write-Host ("RAM  [{0}] {1} / {2} GB ({3} %)" -f (Get-Bar $ramPct), $usedGB, $totalGB, $ramPct)
+            Write-Host ("Ổ đĩa: {0} MB/s | Mạng: {1} MB/s | Ổ C trống: {2} GB" -f [math]::Round($disk / 1MB, 1), [math]::Round($net / 1MB, 2), $free)
+            Write-Host ""
+            Write-Host "Top 5 tiến trình tốn RAM:" -ForegroundColor Yellow
+            Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 5 Name, @{ N = "RAM_MB"; E = { [math]::Round($_.WorkingSet64 / 1MB) } } | Format-Table -AutoSize
+            Write-Host "FPS: mở 'MSI Afterburner' hoặc 'RTSS FPS' trên Desktop; PresentMon ở C:\Tools\PresentMon." -ForegroundColor Green
+            Write-Host "Lưu ý: máy chủ không có GPU thật, đồ hoạ chạy bằng CPU nên FPS game nặng sẽ thấp." -ForegroundColor DarkGray
+            Start-Sleep -Seconds 2
+          }
+          '@
+
+          $optVbs = @'
+          ' Mo Toi-uu-PC.ps1 voi quyen admin, an hoan toan (khong hien cmd/PowerShell)
+          Option Explicit
+          Dim sh, fso, base, ps1
+          Set sh = CreateObject("WScript.Shell")
+          Set fso = CreateObject("Scripting.FileSystemObject")
+          base = fso.GetParentFolderName(WScript.ScriptFullName)
+          ps1 = base & "\Toi-uu-PC.ps1"
+          ' runas: Windows hoi UAC mot lan; 0: cua so PowerShell an
+          sh.ShellExecute "powershell.exe", "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File """ & ps1 & """", base, "runas", 0
+          '@
+
+          $monVbs = @'
+          ' Mo Xem-FPS-RAM.ps1 trong cua so PowerShell (khong qua cmd)
+          Option Explicit
+          Dim sh, fso, base, ps1
+          Set sh = CreateObject("WScript.Shell")
+          Set fso = CreateObject("Scripting.FileSystemObject")
+          base = fso.GetParentFolderName(WScript.ScriptFullName)
+          ps1 = base & "\Xem-FPS-RAM.ps1"
+          sh.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -File """ & ps1 & """", 1, False
+          '@
+
+          try {
+            # BOM để Windows PowerShell 5.1 đọc đúng tiếng Việt
+            Set-Content -Path (Join-Path $desk "Toi-uu-PC.ps1")    -Value $optPs1 -Encoding utf8BOM
+            Set-Content -Path (Join-Path $desk "Xem-FPS-RAM.ps1")  -Value $monPs1 -Encoding utf8BOM
+            Set-Content -Path (Join-Path $desk "Toi-uu-PC.vbs")    -Value $optVbs -Encoding ascii
+            Set-Content -Path (Join-Path $desk "Xem-FPS-RAM.vbs")  -Value $monVbs -Encoding ascii
+            # Xoá .bat cũ (nếu có) để không còn cửa sổ cmd nào
+            Remove-Item (Join-Path $desk "Toi-uu-PC.bat"), (Join-Path $desk "Xem-FPS-RAM.bat") -Force -ErrorAction SilentlyContinue
+            $res += "File tối ưu trên Desktop: OK"
+          } catch {
+            Write-Warning "Tạo file tối ưu lỗi: $($_.Exception.Message)"
+            $res += "File tối ưu trên Desktop: LỖI"
+          }
+
+          $res += "Thời gian bước 6c: $([int]((Get-Date) - $t0).TotalSeconds) giây"
+          $res | ForEach-Object { Write-Host $_ }
+          Add-Content -Path $env:GITHUB_ENV -Value "TOOLS_STATUS=$($res -join ' | ')"
+          exit 0
+
+      - name: 6d. Cài Discord và Roblox Studio
+        shell: pwsh
+        continue-on-error: true
+        timeout-minutes: 25
+        run: |
+          $ErrorActionPreference = "Continue"
+          $PSNativeCommandUseErrorActionPreference = $false
+          $ProgressPreference = "SilentlyContinue"
+          $res = @()
+
+          function Invoke-Retry {
+            param([scriptblock]$Action, [int]$Count = 3, [int]$DelaySec = 5)
+            for ($i = 1; $i -le $Count; $i++) {
+              try { return (& $Action) }
+              catch {
+                if ($i -ge $Count) { throw }
+                Write-Warning "Lần $i/$Count lỗi: $($_.Exception.Message) - thử lại sau $DelaySec giây..."
+                Start-Sleep -Seconds $DelaySec
+              }
+            }
+          }
+
+          $desk = Join-Path $env:PUBLIC "Desktop"
+          New-Item -ItemType Directory -Path $desk -Force | Out-Null
+          $isArm = ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") -or ($env:PROCESSOR_ARCHITEW6432 -eq "ARM64")
+
+          function Get-DiscordExe {
+            $paths = @(
+              (Join-Path $env:LOCALAPPDATA "Discord\Update.exe"),
+              (Join-Path $env:LOCALAPPDATA "Discord\app-*\Discord.exe"),
+              "C:\Users\runneradmin\AppData\Local\Discord\Update.exe",
+              "C:\Users\runneradmin\AppData\Local\Discord\app-*\Discord.exe",
+              (Join-Path $env:ProgramFiles "Discord\Discord.exe")
+            )
+            foreach ($p in $paths) {
+              $f = Get-Item $p -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($f) { return $f.FullName }
+            }
+            return $null
+          }
+
+          # --- Discord: choco trước, lỗi thì tải installer chính thức ---
+          if (Get-DiscordExe) {
+            $res += "Discord: đã có sẵn"
+          } else {
+            $ok = $false
+            if (Get-Command choco -ErrorAction SilentlyContinue) {
+              Write-Host "=== choco install discord.install ==="
+              choco install discord.install -y --no-progress --limit-output 2>&1 | ForEach-Object { Write-Host $_ }
+              if ($LASTEXITCODE -in @(0, 1641, 3010) -and (Get-DiscordExe)) { $ok = $true }
+            }
+            if (-not $ok) {
+              # Dọn tiến trình Discord còn sót để installer không báo InconsistentInstallerState
+              Get-Process Discord -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+              Get-Process Update -ErrorAction SilentlyContinue |
+                Where-Object { try { $_.Path -like "*\Discord\Update.exe" } catch { $false } } |
+                Stop-Process -Force -ErrorAction SilentlyContinue
+              $setup = Join-Path $desk "DiscordSetup.exe"
+              try {
+                Invoke-Retry {
+                  Invoke-WebRequest -Uri "https://discord.com/api/downloads/distributions/app/installers/latest?channel=stable&platform=win&arch=x64" `
+                    -OutFile $setup -MaximumRedirection 10 -Headers @{ "User-Agent" = "Mozilla/5.0" } -ErrorAction Stop
+                } | Out-Null
+                Unblock-File -Path $setup -ErrorAction SilentlyContinue
+                if ((Get-Item $setup).Length -lt 5MB) { throw "File installer quá nhỏ." }
+                $p = Start-Process $setup -ArgumentList "-s" -PassThru -WindowStyle Hidden
+                if (-not $p.WaitForExit(300000)) { taskkill /PID $p.Id /T /F 2>&1 | Out-Null }
+                Start-Sleep -Seconds 5
+                if (Get-DiscordExe) { $ok = $true }
+              } catch { Write-Warning "Discord tải/cài lỗi: $($_.Exception.Message)" }
+            }
+            if ($ok) {
+              $res += "Discord: OK"
+            } elseif (Test-Path (Join-Path $desk "DiscordSetup.exe")) {
+              $res += "Discord: đã tải DiscordSetup.exe ở Desktop (bấm để cài tay)"
+            } else {
+              $res += "Discord: LỖI (không tải/cài được)"
+            }
+          }
+
+          # --- Roblox Studio: chỉ có installer x64 chính thức, không có gói choco ---
+          function Get-StudioExe {
+            $dirs = @(
+              (Join-Path $env:LOCALAPPDATA "Roblox\Versions"),
+              "C:\Users\runneradmin\AppData\Local\Roblox\Versions"
+            ) | Select-Object -Unique
+            foreach ($d in $dirs) {
+              $f = Get-ChildItem $d -Filter "RobloxStudioBeta.exe" -Recurse -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+              if ($f) { return $f.FullName }
+            }
+            return $null
+          }
+
+          if (Get-StudioExe) {
+            $res += "Roblox Studio: đã có sẵn"
+          } else {
+            $rbx = Join-Path $desk "RobloxStudioInstaller.exe"
+            try {
+              Invoke-Retry {
+                Invoke-WebRequest -Uri "https://setup.rbxcdn.com/RobloxStudioInstaller.exe" `
+                  -OutFile $rbx -MaximumRedirection 10 -Headers @{ "User-Agent" = "Mozilla/5.0" } -ErrorAction Stop
+              } -Count 3 -DelaySec 10 | Out-Null
+              Unblock-File -Path $rbx -ErrorAction SilentlyContinue
+              if ((Get-Item $rbx).Length -lt 5MB) { throw "File installer quá nhỏ." }
+              Write-Host "Đang cài Roblox Studio (có thể mất 1-5 phút)..."
+              $installStart = Get-Date
+              $p = Start-Process $rbx -PassThru -WindowStyle Hidden
+              $p.WaitForExit(600000) | Out-Null
+              for ($i = 0; $i -lt 60 -and -not (Get-StudioExe); $i++) { Start-Sleep -Seconds 5 }
+              if (Get-StudioExe) {
+                # Chỉ đóng Studio do installer vừa mở, không đóng Studio người dùng đang mở
+                Get-Process RobloxStudioBeta -ErrorAction SilentlyContinue |
+                  Where-Object { try { $_.StartTime -ge $installStart } catch { $false } } |
+                  Stop-Process -Force -ErrorAction SilentlyContinue
+                $res += "Roblox Studio: OK"
+              } else {
+                $res += "Roblox Studio: đã tải RobloxStudioInstaller.exe ở Desktop (bấm để cài tay)"
+              }
+            } catch {
+              if (Test-Path $rbx) {
+                $res += "Roblox Studio: đã tải RobloxStudioInstaller.exe ở Desktop (bấm để cài tay)"
+              } else {
+                $res += "Roblox Studio: LỖI (không tải/cài được)"
+              }
+              Write-Warning "Roblox Studio: $($_.Exception.Message)"
+            }
+          }
+
+          if ($isArm) {
+            $res += "Lưu ý ARM64: Discord/Roblox là bản x64, chạy giả lập nên có thể chậm hoặc lỗi"
+          }
+
+          $res | ForEach-Object { Write-Host $_ }
+          Add-Content -Path $env:GITHUB_ENV -Value "APP_STATUS=$($res -join ' | ')"
+          exit 0
+
+      - name: 7. GPU ảo (Mesa llvmpipe/lavapipe, tùy chọn luồng CPU)
+        shell: pwsh
+        continue-on-error: true
+        timeout-minutes: 15
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Continue"
+          $PSNativeCommandUseErrorActionPreference = $false
+          $ProgressPreference = "SilentlyContinue"
+          $isArm = ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") -or ((Get-CimInstance Win32_OperatingSystem).OSArchitecture -match "ARM")
+          function Invoke-Retry {
+            param([scriptblock]$Action, [int]$Count = 3, [int]$DelaySec = 5)
+            for ($i = 1; $i -le $Count; $i++) {
+              try { return (& $Action) }
+              catch {
+                if ($i -ge $Count) { throw }
+                Write-Warning "Lần $i/$Count lỗi: $($_.Exception.Message) - thử lại sau $DelaySec giây..."
+                Start-Sleep -Seconds $DelaySec
+              }
+            }
+          }
+          # Cài DLL OpenGL Mesa vào System32 (có sao lưu bản gốc), không cần thao tác tay
+          function Install-MesaGL([string]$Src) {
+            $sys = "$env:SystemRoot\System32"
+            $bk = "C:\Mesa\backup"
+            New-Item -ItemType Directory -Path $bk -Force | Out-Null
+            $copied = 0
+            foreach ($n in @("opengl32.dll", "libgallium_wgl.dll", "libglapi.dll")) {
+              $f = Get-ChildItem $Src -Filter $n -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+              if (-not $f) { continue }
+              $dst = Join-Path $sys $n
+              if (Test-Path $dst) {
+                takeown /f $dst /a 2>&1 | Out-Null
+                icacls $dst /grant "*S-1-5-32-544:F" 2>&1 | Out-Null
+                Copy-Item $dst (Join-Path $bk $n) -Force -ErrorAction SilentlyContinue
+              }
+              try {
+                Copy-Item $f.FullName $dst -Force -ErrorAction Stop
+                $copied++
+              } catch {
+                Write-Warning "Không chép được $n vào System32: $($_.Exception.Message)"
+              }
+            }
+            return ($copied -gt 0)
+          }
+
+          # Kiểm tra Vulkan: loader + ICD + vulkaninfo (nếu có)
+          function Test-Vulkan([string]$IcdPath) {
+            $loader = Test-Path "$env:SystemRoot\System32\vulkan-1.dll"
+            $icdOk = $false
+            if ($IcdPath -and (Test-Path $IcdPath)) {
+              try {
+                $j = Get-Content $IcdPath -Raw | ConvertFrom-Json
+                $lib = "$($j.ICD.library_path)"
+                if ($lib) {
+                  $libFull = if ([IO.Path]::IsPathRooted($lib)) { $lib } else { Join-Path (Split-Path $IcdPath -Parent) $lib }
+                  $icdOk = Test-Path $libFull
+                } else { $icdOk = $true }
+              } catch { $icdOk = $false }
+            }
+            $viPath = $null
+            $vi = Get-Command vulkaninfo.exe -ErrorAction SilentlyContinue
+            if ($vi) { $viPath = $vi.Source }
+            if (-not $viPath -and $env:VULKAN_SDK) {
+              $p = Join-Path $env:VULKAN_SDK "Bin\vulkaninfo.exe"
+              if (Test-Path $p) { $viPath = $p }
+            }
+            if (-not $viPath -and (Test-Path "C:\VulkanSDK")) {
+              $f = Get-ChildItem "C:\VulkanSDK" -Filter "vulkaninfo.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($f) { $viPath = $f.FullName }
+            }
+            $vk = "loader $(if ($loader) {'OK'} else {'THIẾU'}) | ICD $(if ($icdOk) {'OK'} else {'LỖI'})"
+            if ($viPath) {
+              Write-Host "vulkaninfo: $viPath"
+              $out = (& $viPath --summary 2>&1 | Out-String)
+              $out -split "`r?`n" | Select-Object -First 30 | ForEach-Object { Write-Host $_ }
+              if ($out -match "lavapipe|llvmpipe|Mesa") { $vk += " | vulkaninfo: thấy lavapipe" }
+              else { $vk += " | vulkaninfo: chạy nhưng không thấy lavapipe" }
+            } else {
+              $vk += " | vulkaninfo: chưa có (bật install_extra để cài SDK)"
+            }
+            return $vk
+          }
+
+          # Cài Vulkan loader (vulkan-1.dll) từ NuGet nếu máy chưa có
+          function Install-VulkanLoader([string]$Rid) {
+            if (Test-Path "$env:SystemRoot\System32\vulkan-1.dll") { return $true }
+            try {
+              $nupkg = "$env:TEMP\vulkan-loader-$Rid.nupkg"
+              # Silk.NET.Vulkan.Loader.Native đóng gói loader chính thức của LunarG
+              Invoke-Retry {
+                Invoke-WebRequest -Uri "https://api.nuget.org/v3-flatcontainer/silk.net.vulkan.loader.native/2025.9.12/silk.net.vulkan.loader.native.2025.9.12.nupkg" -OutFile $nupkg -Headers @{ "User-Agent" = "Mozilla/5.0" } -ErrorAction Stop
+              } | Out-Null
+              $zip = "$env:TEMP\vulkan-loader-$Rid.zip"
+              Copy-Item $nupkg $zip -Force
+              $dst = "$env:TEMP\vulkan-loader-$Rid"
+              Remove-Item $dst -Recurse -Force -ErrorAction SilentlyContinue
+              Expand-Archive -Path $zip -DestinationPath $dst -Force
+              $dll = Get-ChildItem $dst -Filter "vulkan-1.dll" -Recurse -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -match "win-$Rid" } | Select-Object -First 1
+              if ($dll) {
+                Copy-Item $dll.FullName "$env:SystemRoot\System32\vulkan-1.dll" -Force -ErrorAction Stop
+                Write-Host "Đã cài Vulkan loader $Rid từ NuGet."
+                return $true
+              }
+            } catch {
+              Write-Warning "Cài Vulkan loader $Rid lỗi: $($_.Exception.Message)"
+            }
+            return $false
+          }
+
+          if ($isArm) {
+            # Windows 11 ARM64: dùng bản Mesa ARM64 của mmozeiko/build-mesa
+            try {
+              $hdr = @{ "User-Agent" = "gh-actions"; "Authorization" = "Bearer $env:GH_TOKEN" }
+              $rel = Invoke-Retry {
+                Invoke-RestMethod "https://api.github.com/repos/mmozeiko/build-mesa/releases/latest" -Headers $hdr -ErrorAction Stop
+              }
+              $7z = (Get-Command 7z.exe -ErrorAction SilentlyContinue).Source
+              if (-not $7z) { $7z = "$env:ProgramFiles\7-Zip\7z.exe" }
+              if (-not (Test-Path $7z)) { throw "Không có 7-Zip để giải nén." }
+              New-Item -ItemType Directory -Path "C:\Mesa\arm64" -Force | Out-Null
+
+              foreach ($kind in @("llvmpipe", "lavapipe")) {
+                $asset = $rel.assets | Where-Object { $_.name -match "^mesa-$kind-arm64-.*\.7z$" } | Select-Object -First 1
+                if (-not $asset) { Write-Warning "Không thấy bản $kind arm64."; continue }
+                Write-Host "Mesa ARM64: $($asset.name)"
+                $z = "$env:TEMP\mesa-$kind-arm64.7z"
+                Invoke-Retry {
+                  Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $z -MaximumRedirection 10 -Headers @{ "User-Agent" = "Mozilla/5.0" } -ErrorAction Stop
+                } -Count 3 -DelaySec 10 | Out-Null
+                & $7z x $z "-oC:\Mesa\arm64\$kind" -y | Out-Null
+              }
+
+              # Vulkan lavapipe: đăng ký ICD + biến môi trường
+              $icd = Get-ChildItem "C:\Mesa\arm64\lavapipe" -Filter "lvp_icd*.json" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($icd) {
+                $key = "HKLM:\SOFTWARE\Khronos\Vulkan\Drivers"
+                if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
+                New-ItemProperty -Path $key -Name $icd.FullName -Value 0 -PropertyType DWord -Force | Out-Null
+                [Environment]::SetEnvironmentVariable("VK_DRIVER_FILES", $icd.FullName, "Machine")
+                [Environment]::SetEnvironmentVariable("VK_ICD_FILENAMES", $icd.FullName, "Machine")
+                $env:VK_DRIVER_FILES = $icd.FullName
+                $env:VK_ICD_FILENAMES = $icd.FullName
+                Write-Host "Đã đăng ký Vulkan lavapipe ARM64: $($icd.FullName)"
+              } else {
+                Write-Warning "Không thấy lvp_icd*.json trong bản lavapipe arm64."
+              }
+
+              # Số luồng CPU cho GPU ảo (input vulkan_threads), luôn chừa ít nhất 1 luồng cho app/RDP
+              $lpThreads = if ($env:VULKAN_THREADS) { "$env:VULKAN_THREADS" } else { "3" }
+              $cpuCount = [Environment]::ProcessorCount
+              if ([int]$lpThreads -ge $cpuCount) { $lpThreads = [string]([Math]::Max(1, $cpuCount - 1)) }
+              [Environment]::SetEnvironmentVariable("LP_NUM_THREADS", $lpThreads, "Machine")
+              [Environment]::SetEnvironmentVariable("GALLIUM_DRIVER", "llvmpipe", "Machine")
+              [Environment]::SetEnvironmentVariable("MESA_VK_WSI_PRESENT_MODE", "mailbox", "Machine")
+              $env:LP_NUM_THREADS = $lpThreads
+              $env:MESA_VK_WSI_PRESENT_MODE = "mailbox"
+
+              # OpenGL llvmpipe ARM64: tự chép vào System32
+              $glOk = Install-MesaGL "C:\Mesa\arm64\llvmpipe"
+
+              # Vulkan loader ARM64: dùng sẵn của máy, nếu thiếu thì lấy từ NuGet
+              $loader = Install-VulkanLoader "arm64"
+              if (-not $loader) {
+                Write-Warning "Chưa có vulkan-1.dll (Vulkan loader) trên Windows ARM64, app Vulkan có thể không thấy GPU ảo."
+              }
+              $glTxt = if ($glOk) { "OK" } else { "LỖI" }
+              $vkTxt = Test-Vulkan $icd.FullName
+              Write-Host "ARM64: OpenGL $glTxt | Vulkan $vkTxt"
+              Add-Content -Path $env:GITHUB_ENV -Value "GPU_STATUS=Mesa ARM64 (${lpThreads} luồng): OpenGL $glTxt, Vulkan $vkTxt"
+            } catch {
+              Write-Warning "GPU ảo ARM64 lỗi: $($_.Exception.Message)"
+              Add-Content -Path $env:GITHUB_ENV -Value "GPU_STATUS=LỖI ARM64 (xem log bước 7)"
+            }
+            exit 0
+          }
+
+          try {
+            $hdr = @{ "User-Agent" = "gh-actions"; "Authorization" = "Bearer $env:GH_TOKEN" }
+            $rel = Invoke-Retry {
+              Invoke-RestMethod "https://api.github.com/repos/pal1000/mesa-dist-win/releases/latest" -Headers $hdr -ErrorAction Stop
+            }
+            $asset = $rel.assets | Where-Object { $_.name -match 'release-msvc\.7z$' } | Select-Object -First 1
+            if (-not $asset) { throw "Không thấy file Mesa release-msvc." }
+            Write-Host "Mesa: $($asset.name)"
+
+            $z = "$env:TEMP\mesa.7z"
+            Invoke-Retry {
+              Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $z -MaximumRedirection 10 -Headers @{ "User-Agent" = "Mozilla/5.0" } -ErrorAction Stop
+            } -Count 3 -DelaySec 10 | Out-Null
+
+            $7z = (Get-Command 7z.exe -ErrorAction SilentlyContinue).Source
+            if (-not $7z) { $7z = "$env:ProgramFiles\7-Zip\7z.exe" }
+            if (-not (Test-Path $7z)) { throw "Không có 7-Zip để giải nén." }
+            New-Item -ItemType Directory -Path "C:\Mesa" -Force | Out-Null
+            & $7z x $z -oC:\Mesa -y | Out-Null
+
+            $x64 = "C:\Mesa\x64"
+            if (-not (Test-Path $x64)) { throw "Không thấy thư mục Mesa x64." }
+
+            # Vulkan loader x64: bước 6 thường đã cài; nếu chưa thì lấy từ NuGet
+            $loader = Install-VulkanLoader "x64"
+            if (-not $loader) {
+              Write-Warning "Thiếu vulkan-1.dll x64, app Vulkan có thể không chạy."
+            }
+
+            # Vulkan: đăng ký lavapipe (GPU ảo bằng CPU) cho toàn hệ thống
+            $icd = Get-ChildItem $x64 -Filter "lvp_icd*.json" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($icd) {
+              $key = "HKLM:\SOFTWARE\Khronos\Vulkan\Drivers"
+              if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
+              New-ItemProperty -Path $key -Name $icd.FullName -Value 0 -PropertyType DWord -Force | Out-Null
+              # Ép loader dùng lavapipe, kể cả app không đọc registry
+              [Environment]::SetEnvironmentVariable("VK_DRIVER_FILES", $icd.FullName, "Machine")
+              [Environment]::SetEnvironmentVariable("VK_ICD_FILENAMES", $icd.FullName, "Machine")
+              $env:VK_DRIVER_FILES = $icd.FullName
+              $env:VK_ICD_FILENAMES = $icd.FullName
+              Write-Host "Đã đăng ký Vulkan lavapipe: $($icd.FullName)"
+            } else {
+              Write-Warning "Không thấy lvp_icd*.json trong bản Mesa này."
+            }
+
+            # Số luồng CPU cho GPU ảo (input vulkan_threads), luôn chừa ít nhất 1 luồng cho app/RDP
+            $lpThreads = if ($env:VULKAN_THREADS) { "$env:VULKAN_THREADS" } else { "3" }
+            $cpuCount = [Environment]::ProcessorCount
+            if ([int]$lpThreads -ge $cpuCount) { $lpThreads = [string]([Math]::Max(1, $cpuCount - 1)) }
+            [Environment]::SetEnvironmentVariable("LP_NUM_THREADS", $lpThreads, "Machine")
+            [Environment]::SetEnvironmentVariable("GALLIUM_DRIVER", "llvmpipe", "Machine")
+            [Environment]::SetEnvironmentVariable("MESA_VK_WSI_PRESENT_MODE", "mailbox", "Machine")
+            $env:LP_NUM_THREADS = $lpThreads
+            $env:MESA_VK_WSI_PRESENT_MODE = "mailbox"
+
+            $vkStatus = Test-Vulkan $icd.FullName
+
+            # OpenGL: tự chạy systemwidedeploy.cmd (trả lời menu tự động, tối đa 2 phút)
+            $glStatus = "chưa xác nhận"
+            $deploy = "C:\Mesa\systemwidedeploy.cmd"
+            if (Test-Path $deploy) {
+              $inp = "$env:TEMP\mesa-in.txt"
+              "1`r`n1`r`n`r`n`r`n`r`n" | Set-Content -Path $inp -Encoding ASCII
+              $p = Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$deploy`" < `"$inp`"" `
+                -WorkingDirectory "C:\Mesa" -WindowStyle Hidden -PassThru
+              if (-not $p.WaitForExit(120000)) {
+                Write-Warning "systemwidedeploy quá 2 phút, dừng."
+                taskkill /PID $p.Id /T /F 2>&1 | Out-Null
+              }
+              $sys = "$env:SystemRoot\System32"
+              if ((Test-Path "$sys\libgallium_wgl.dll") -or (Test-Path "$sys\mesadrv.dll") -or (Test-Path "$sys\libglapi.dll")) {
+                $glStatus = "OK"
+              } else {
+                Write-Warning "systemwidedeploy chưa chép DLL, tự chép trực tiếp vào System32..."
+                if (Install-MesaGL $x64) { $glStatus = "OK (chép trực tiếp)" } else { $glStatus = "LỖI" }
+              }
+            }
+            # systemwidedeploy có thể vắng mặt/đổi menu ở bản Mesa mới -> luôn có đường chép trực tiếp
+            if ($glStatus -ne "OK") {
+              Write-Warning "OpenGL chưa OK, tự chép DLL Mesa x64 vào System32..."
+              if (Install-MesaGL $x64) { $glStatus = "OK (chép trực tiếp)" } else { $glStatus = "LỖI" }
+            }
+            Write-Host "OpenGL Mesa: $glStatus"
+            Write-Host "Vulkan: $vkStatus"
+            Add-Content -Path $env:GITHUB_ENV -Value "GPU_STATUS=Vulkan lavapipe: $vkStatus, OpenGL $glStatus, LP_NUM_THREADS=$lpThreads"
+          } catch {
+            Write-Warning "GPU ảo lỗi: $($_.Exception.Message)"
+            Add-Content -Path $env:GITHUB_ENV -Value "GPU_STATUS=LỖI (xem log bước 7)"
+          }
+          exit 0
+
+      - name: 8. Thông tin kết nối
+        shell: pwsh
+        run: |
+          $ip = $env:TS_IP
+          if (-not $ip) {
+            $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+            $ip = (& $ts ip -4 2>$null | ForEach-Object {
+              $m = [regex]::Match($_, '100\.\d{1,3}\.\d{1,3}\.\d{1,3}')
+              if ($m.Success) { $m.Value }
+            } | Select-Object -First 1)
+          }
+          if (-not $ip) { throw "Không lấy được Tailscale IP." }
+
+          $os = (Get-CimInstance Win32_OperatingSystem).Caption
+          $gpuFake = if ($env:GPU_FAKE) { "$($env:GPU_FAKE) (nhãn giả lập, không có GPU thật)" } else { "chưa đổi" }
+          $tsWatch = if ($env:TS_WATCHDOG) { $env:TS_WATCHDOG } else { "chưa bật" }
+          $apps = if ($env:APP_STATUS) { $env:APP_STATUS } else { "chưa cài" }
+          $wall = if ($env:WALLPAPER_STATUS) { $env:WALLPAPER_STATUS } else { "chưa đặt" }
+          $mode = if ($env:INSTALL_EXTRA -eq "true") { "đầy đủ" } else { "nhanh (mặc định)" }
+          $kind = if ($env:GITHUB_EVENT_NAME -eq "schedule") { "tự động theo lịch" } elseif ($env:RENEW_FROM) { "tự động nối lượt" } else { "chạy tay" }
+          $bootMin = if ($env:JOB_START) { [math]::Round(([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [long]$env:JOB_START) / 60, 1) } else { "?" }
+
+          $text = @(
+            "## RDP sẵn sàng",
+            "- Windows: $os",
+            "- Runner: $env:RDP_RUNNER",
+            "- Kiểu chạy: $kind",
+            "- Host: $ip",
+            "- Port: 3389",
+            "- User: $env:RDP_USER",
+            "- Password: secret RDP_PASSWORD",
+            "- Cấu hình: $($env:HW_STATUS)",
+            "- Chất lượng RDP: $($env:RDP_QUALITY) (smooth = 30fps nhẹ mạng; balanced/sharp = 60fps, sharp bật ClearType)",
+            "- Mẹo giảm lag: client hạ resolution, tắt clipboard/ổ đĩa/máy in, Experience = Low-speed nếu mạng yếu.",
+            "- Kiểm tra Tailscale trên máy khách: chạy tailscale ping tới IP runner; nếu báo 'via DERP' là đang relay -> lag cao, khó fix từ server.",
+            "- Vulkan/App: $($env:EXTRA_STATUS)",
+            "- GPU ảo: $($env:GPU_STATUS)",
+            "- GPU hiển thị: $gpuFake",
+            "- Hình nền: $wall",
+            "- Tiện ích: $($env:UTIL_STATUS)",
+            "- Tailscale tự phục hồi: $tsWatch (đóng nhầm cửa sổ không mất kết nối)",
+            "- Mic: đã bật best-effort; trên client chọn 'Record from this computer'. Nếu vẫn báo 'No input devices', Windows Server thiếu RDSH nên mic không qua được.",
+            "- Discord/Roblox Studio: $apps",
+            "- Chế độ cài: $mode",
+            "- Khởi động xong sau: $bootMin phút",
+            "- App FPS/RAM + file tối ưu: $($env:TOOLS_STATUS). Desktop: Toi-uu-PC.vbs (ẩn), Xem-FPS-RAM.vbs; shortcut MSI Afterburner/RTSS (nếu cài được). Log: C:\Tools\toi-uu-pc.log",
+            "- Thời gian: $env:RDP_MINUTES phút"
+          ) -join "`n"
+          Add-Content $env:GITHUB_STEP_SUMMARY $text
+          Write-Host $text
+
+      - name: 9. Giữ máy
+        shell: pwsh
+        timeout-minutes: ${{ fromJSON(github.event.inputs.minutes || '330') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Kết thúc sớm 3 phút so với timeout của step để step luôn xanh, không bị cắt giữa chừng
+          $minutes = if ("$env:RDP_MINUTES" -match '^\d+$') { [int]$env:RDP_MINUTES } else { 330 }
+          if ($minutes -lt 5) { $minutes = 5 }
+          $end = (Get-Date).AddMinutes($minutes - 3)
+          $renew = "$env:RDP_AUTO_RENEW" -eq "true"
+          $extra = if ("$env:INSTALL_EXTRA" -eq "true") { "true" } else { "false" }
+          $vkThreads = if ($env:VULKAN_THREADS) { "$env:VULKAN_THREADS" } else { "3" }
+          $quality = if ($env:RDP_QUALITY) { "$env:RDP_QUALITY" } else { "balanced" }
+          $renewed = $false
+
+          # GitHub giới hạn 1 job tối đa 360 phút: luôn chốt sớm ở phút 350 để job kết thúc sạch
+          if ($env:JOB_START) {
+            $hardEnd = [DateTimeOffset]::FromUnixTimeSeconds([long]$env:JOB_START).LocalDateTime.AddMinutes(350)
+            if ($end -gt $hardEnd) { $end = $hardEnd }
+          }
+          Write-Host "RDP sống đến $($end.ToString('HH:mm:ss')). Tự nối lượt: $renew"
+          $warned = $false
+          $tick = 0
+          while ((Get-Date) -lt $end) {
+            Start-Sleep -Seconds 60
+            $tick++
+
+            # Còn 30 phút: gọi lại workflow này để bật máy mới kịp cài app trước khi máy cũ tắt
+            # (bộ nhanh mất ~10-20 phút cho các bước cài đặt; để 30 phút là an toàn)
+            if ($renew -and -not $renewed -and ((Get-Date) -gt $end.AddMinutes(-30))) {
+              $dispatchOk = $false
+              try {
+                $wfFile = ("${{ github.workflow_ref }}" -replace '^[^/]+/[^/]+/\.github/workflows/', '') -replace '@.*$', ''
+                $uri = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/$wfFile/dispatches"
+                $hdr = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
+                $payload = @{
+                  ref    = "${{ github.ref_name }}"
+                  inputs = @{ runner = "$env:RDP_RUNNER"; minutes = "$minutes"; auto_renew = "true"; install_extra = $extra; vulkan_threads = $vkThreads; rdp_quality = $quality; renew_from = "${{ github.run_id }}" }
+                } | ConvertTo-Json -Depth 5
+                Invoke-RestMethod -Method Post -Uri $uri -Headers $hdr -Body $payload -ContentType "application/json" | Out-Null
+                $dispatchOk = $true
+              } catch {
+                $msg = $_.Exception.Message
+                if ($_.ErrorDetails.Message) { $msg = "$msg | $($_.ErrorDetails.Message)" }
+                Write-Warning "Gọi workflow mới lỗi: $msg"
+              }
+              if ($dispatchOk) {
+                $renewed = $true
+                Write-Host "Đã bật máy mới nối tiếp. IP mới xem ở mục Summary của lượt chạy mới (tab Actions)."
+              } else {
+                Write-Warning "Chưa nối được lượt mới, sẽ thử lại sau 1 phút."
+              }
+            }
+
+            # Cảnh báo trước 10 phút: thông báo ngay trong máy (nếu có msg.exe)
+            if (-not $warned -and ((Get-Date) -gt $end.AddMinutes(-10))) {
+              $warned = $true
+              if (Get-Command msg.exe -ErrorAction SilentlyContinue) {
+                msg * /TIME:300 "Máy sắp tắt trong 10 phút, hãy lưu file!" 2>$null
+              }
+            }
+
+            # Mỗi 30 phút dọn rác; mỗi 5 phút ghi trạng thái Tailscale (trực tiếp hay relay)
+            if ($tick % 30 -eq 0) {
+              Remove-Item "$env:TEMP\*" -Recurse -Force -ErrorAction SilentlyContinue
+              Remove-Item "$env:SystemRoot\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            if ($tick % 5 -eq 0) {
+              $tsx = "$env:ProgramFiles\Tailscale\tailscale.exe"
+              if (Test-Path $tsx) { & $tsx status 2>&1 | Select-Object -First 8 | ForEach-Object { Write-Host $_ } }
+            }
+            # Tự phục hồi nếu RDP/Tailscale bị tắt
+            try {
+              if (-not (Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue)) {
+                Write-Warning "RDP rớt, khởi động lại TermService..."
+                Restart-Service TermService -Force -ErrorAction SilentlyContinue
+              }
+              $t = Get-Service | Where-Object { $_.Name -match 'Tailscale' } | Select-Object -First 1
+              if ($t -and $t.Status -ne "Running") { Start-Service $t.Name -ErrorAction SilentlyContinue }
+            } catch { }
+          }
+          exit 0
+
+      - name: 9b. Nén file làm việc để sao lưu
+        if: always()
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $dirs = @("$env:USERPROFILE\Desktop", "$env:USERPROFILE\Documents", "$env:USERPROFILE\Downloads") |
+            Where-Object { Test-Path $_ }
+          $backup = "$env:RUNNER_TEMP\backup"
+          $stage  = Join-Path $backup "stage"
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+
+          # Chỉ sao lưu file <= 100MB và tổng <= 450MB để upload artifact không vượt quota
+          $maxFile  = 100MB
+          $maxTotal = 450MB
+          $total    = 0
+          $files    = @($dirs | ForEach-Object {
+            Get-ChildItem $_ -Recurse -File -ErrorAction SilentlyContinue |
+              Where-Object { $_.Length -le $maxFile }
+          })
+          foreach ($f in $files) {
+            if (($total + $f.Length) -gt $maxTotal) { break }
+            $base = $dirs | Where-Object { $f.FullName.StartsWith($_, [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
+            if (-not $base) { continue }
+            $rel  = Join-Path (Split-Path $base -Leaf) $f.FullName.Substring($base.Length).TrimStart('\')
+            $dest = Join-Path $stage $rel
+            New-Item -ItemType Directory -Path (Split-Path $dest -Parent) -Force | Out-Null
+            try {
+              Copy-Item -LiteralPath $f.FullName -Destination $dest -Force -ErrorAction Stop
+              $total += $f.Length
+            } catch {
+              Write-Warning "Không sao lưu được $($f.FullName): $($_.Exception.Message)"
+            }
+          }
+          if ($total -gt 0) {
+            Compress-Archive -Path (Join-Path $stage "*") -DestinationPath "$backup\rdp-files.zip" -Force -ErrorAction SilentlyContinue
+            Write-Host ("Đã nén file làm việc: {0} MB (giới hạn {1} MB)." -f [math]::Round($total / 1MB, 1), [math]::Round($maxTotal / 1MB, 0))
+          } else {
+            Write-Host "Không có file để sao lưu."
+          }
+
+      - name: 9c. Upload sao lưu
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: rdp-files
+          path: ${{ runner.temp }}/backup/rdp-files.zip
+          retention-days: 3
+          if-no-files-found: ignore
+
+      - name: 10. Debug khi lỗi
+        if: failure() || cancelled()
+        shell: pwsh
+        run: |
+          Write-Host "User: $([Security.Principal.WindowsIdentity]::GetCurrent().Name)"
+          Get-Service TermService, Tailscale -ErrorAction SilentlyContinue | Format-Table Name, Status, StartType
+          Get-NetTCPConnection -LocalPort 3389 -ErrorAction SilentlyContinue | Format-Table LocalAddress, LocalPort, State
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (Test-Path $ts) {
+            & $ts version 2>&1 | ForEach-Object { Write-Host $_ }
+            & $ts status 2>&1 | ForEach-Object { Write-Host $_ }
+            & $ts ip -4 2>&1 | ForEach-Object { Write-Host $_ }
+          }
+          Get-ChildItem "$env:ProgramData\Tailscale" -Filter *.log -Recurse -ErrorAction SilentlyContinue |
+            Select-Object -First 3 |
+            ForEach-Object {
+              Write-Host "----- $($_.FullName) -----"
+              Get-Content $_.FullName -Tail 60 -ErrorAction SilentlyContinue
+            }
